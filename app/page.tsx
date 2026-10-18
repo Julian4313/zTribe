@@ -369,15 +369,16 @@ export default function Home() {
       return;
     }
 
+    const channel = activeChannel;
     setIsSending(true);
     setError(null);
 
     const {
-      data: { user: authUser },
-      error: authError,
-    } = await supabase.auth.getUser();
+      data: { session },
+      error: sessionError,
+    } = await supabase.auth.getSession();
 
-    if (authError || !authUser) {
+    if (sessionError || !session?.access_token || !session.user) {
       setIsSending(false);
       setError("请先登录后再发送消息。");
       setUser(null);
@@ -385,48 +386,63 @@ export default function Home() {
       return;
     }
 
-    const channel = activeChannel;
-    const profileName = await fetchProfileDisplayName(authUser.id);
-    const username =
-      profileName ??
-      profileDisplayName ??
-      getFallbackDisplayName(authUser);
+    try {
+      const response = await fetch("/api/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify({
+          channel,
+          content: text,
+        }),
+      });
 
-    setProfileDisplayName(username);
-    profileNamesRef.current[authUser.id] = username;
+      const payload = (await response.json().catch(() => null)) as
+        | { message?: unknown; error?: string }
+        | null;
 
-    const { data, error: insertError } = await supabase
-      .from("messages")
-      .insert({
-        channel,
-        username,
-        content: text,
-        user_id: authUser.id,
-      })
-      .select(MESSAGE_SELECT)
-      .single();
+      if (!response.ok) {
+        setIsSending(false);
 
-    setIsSending(false);
+        if (response.status === 401) {
+          setError(payload?.error ?? "请先登录后再发送消息。");
+          setUser(null);
+          router.replace("/login");
+          return;
+        }
 
-    if (insertError) {
-      setError(`发送失败：${insertError.message}`);
-      return;
+        setError(payload?.error ?? `发送失败（${response.status}）`);
+        return;
+      }
+
+      const row = normalizeMessageRow(payload?.message);
+      setIsSending(false);
+      setInput("");
+
+      if (!row || channel !== activeChannelRef.current) {
+        return;
+      }
+
+      if (row.user_id) {
+        profileNamesRef.current[row.user_id] = row.username;
+        if (row.user_id === session.user.id) {
+          setProfileDisplayName(row.username);
+        }
+      }
+
+      setMessages((previous) =>
+        appendMessageIfNew(previous, row, profileNamesRef.current),
+      );
+    } catch (err) {
+      setIsSending(false);
+      setError(
+        err instanceof Error
+          ? `发送失败：${err.message}`
+          : "发送失败：网络错误",
+      );
     }
-
-    setInput("");
-
-    if (!data || channel !== activeChannelRef.current) {
-      return;
-    }
-
-    const row = normalizeMessageRow(data);
-    if (!row) {
-      return;
-    }
-
-    setMessages((previous) =>
-      appendMessageIfNew(previous, row, profileNamesRef.current),
-    );
   }
 
   async function handleSignOut() {
