@@ -1,18 +1,23 @@
-
 "use client";
 
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+import { getBrowserEthereumProvider } from "../lib/ethereum-window";
 import { supabase } from "../lib/supabase";
+
+const SIGN_IN_STATEMENT =
+  "授权登录 zTribe 聊天室。签名仅用于验证钱包所有权，不会发起链上交易。";
 
 export default function LoginPage() {
   const router = useRouter();
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [authChecking, setAuthChecking] = useState(true);
+  const [hasWallet, setHasWallet] = useState<boolean | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [info, setInfo] = useState<string | null>(null);
+
+  useEffect(() => {
+    setHasWallet(getBrowserEthereumProvider() !== null);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -54,63 +59,57 @@ export default function LoginPage() {
     };
   }, [router]);
 
-  async function handleSignIn(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  async function handleWalletSignIn() {
+    if (isSubmitting) {
+      return;
+    }
 
-    const trimmedEmail = email.trim();
-    if (!trimmedEmail || !password || isSubmitting) {
+    const provider = getBrowserEthereumProvider();
+    if (!provider) {
+      setError(
+        "未检测到 EVM 钱包。请安装任意支持 Ethereum 的浏览器钱包插件（如 MetaMask、Rabby、Coinbase Wallet 等），刷新本页后重试。",
+      );
       return;
     }
 
     setIsSubmitting(true);
     setError(null);
-    setInfo(null);
 
-    const { error: signInError } = await supabase.auth.signInWithPassword({
-      email: trimmedEmail,
-      password,
+    const { error: signInError } = await supabase.auth.signInWithWeb3({
+      chain: "ethereum",
+      statement: SIGN_IN_STATEMENT,
     });
 
     setIsSubmitting(false);
 
     if (signInError) {
+      const message = signInError.message.toLowerCase();
+
+      if (
+        message.includes("user rejected") ||
+        message.includes("rejected") ||
+        message.includes("denied")
+      ) {
+        setError("你已取消钱包签名，未完成登录。");
+        return;
+      }
+
+      if (
+        message.includes("web3") ||
+        message.includes("provider") ||
+        message.includes("not enabled")
+      ) {
+        setError(
+          `登录失败：${signInError.message}。请在 Supabase 控制台启用 Authentication → Providers → Web3（Ethereum），并将 http://localhost:3000/** 加入 Redirect URLs。`,
+        );
+        return;
+      }
+
       setError(`登录失败：${signInError.message}`);
       return;
     }
 
     router.replace("/");
-  }
-
-  async function handleSignUp() {
-    const trimmedEmail = email.trim();
-    if (!trimmedEmail || !password || isSubmitting) {
-      return;
-    }
-
-    setIsSubmitting(true);
-    setError(null);
-    setInfo(null);
-
-    const { data, error: signUpError } = await supabase.auth.signUp({
-      email: trimmedEmail,
-      password,
-    });
-
-    setIsSubmitting(false);
-
-    if (signUpError) {
-      setError(`注册失败：${signUpError.message}`);
-      return;
-    }
-
-    if (data.session) {
-      router.replace("/");
-      return;
-    }
-
-    setInfo(
-      "注册成功。请查收确认邮件完成验证后再登录；若项目关闭了邮箱确认，也可直接登录。",
-    );
   }
 
   if (authChecking) {
@@ -121,70 +120,39 @@ export default function LoginPage() {
     );
   }
 
-  const canSubmit = email.trim().length > 0 && password.length > 0 && !isSubmitting;
-
   return (
     <main className="flex min-h-screen items-center justify-center bg-[#313338] px-4 text-white">
       <div className="w-full max-w-md rounded-lg bg-[#2b2d31] p-8 shadow-xl">
         <h1 className="mb-2 text-2xl font-bold">欢迎回来</h1>
         <p className="mb-6 text-sm text-gray-400">
-          使用邮箱登录或注册后进入聊天室
+          使用 EVM 钱包签名登录后进入聊天室（Sign-In with Ethereum）
         </p>
 
-        <form onSubmit={handleSignIn} className="space-y-4">
-          <label className="block text-xs font-bold uppercase text-gray-400">
-            邮箱
-            <input
-              type="email"
-              autoComplete="email"
-              value={email}
-              onChange={(event) => setEmail(event.target.value)}
-              disabled={isSubmitting}
-              className="mt-2 w-full rounded bg-[#1e1f22] px-3 py-2.5 text-sm text-white outline-none ring-1 ring-[#1e1f22] focus:ring-indigo-500 disabled:opacity-60"
-            />
-          </label>
+        {hasWallet === false && (
+          <p className="mb-4 rounded bg-[#3a3520] px-3 py-2 text-sm text-amber-200">
+            未检测到浏览器钱包。请安装任意 EVM 钱包扩展（MetaMask、Rabby、OKX
+            Wallet、Coinbase Wallet 等），安装后刷新本页。
+          </p>
+        )}
 
-          <label className="block text-xs font-bold uppercase text-gray-400">
-            密码
-            <input
-              type="password"
-              autoComplete="current-password"
-              value={password}
-              onChange={(event) => setPassword(event.target.value)}
-              disabled={isSubmitting}
-              className="mt-2 w-full rounded bg-[#1e1f22] px-3 py-2.5 text-sm text-white outline-none ring-1 ring-[#1e1f22] focus:ring-indigo-500 disabled:opacity-60"
-            />
-          </label>
+        {error && (
+          <p className="mb-4 rounded bg-[#3f2121] px-3 py-2 text-sm text-red-300">
+            {error}
+          </p>
+        )}
 
-          {error && (
-            <p className="rounded bg-[#3f2121] px-3 py-2 text-sm text-red-300">
-              {error}
-            </p>
-          )}
+        <button
+          type="button"
+          onClick={() => void handleWalletSignIn()}
+          disabled={isSubmitting}
+          className="w-full rounded bg-indigo-500 px-4 py-3 font-medium hover:bg-indigo-400 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {isSubmitting ? "等待钱包签名…" : "连接钱包并登录"}
+        </button>
 
-          {info && (
-            <p className="rounded bg-[#1f3a2a] px-3 py-2 text-sm text-green-300">
-              {info}
-            </p>
-          )}
-
-          <button
-            type="submit"
-            disabled={!canSubmit}
-            className="w-full rounded bg-indigo-500 px-4 py-2.5 font-medium hover:bg-indigo-400 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {isSubmitting ? "处理中..." : "登录"}
-          </button>
-
-          <button
-            type="button"
-            onClick={() => void handleSignUp()}
-            disabled={!canSubmit}
-            className="w-full rounded bg-[#404249] px-4 py-2.5 font-medium hover:bg-[#35373c] disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            注册
-          </button>
-        </form>
+        <p className="mt-4 text-xs leading-relaxed text-gray-500">
+          点击后将唤起钱包，对登录消息进行链下签名，不会产生 gas 费用。
+        </p>
       </div>
     </main>
   );

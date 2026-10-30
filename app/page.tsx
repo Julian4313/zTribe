@@ -10,7 +10,12 @@ import {
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import type { User } from "@supabase/supabase-js";
+import { resolveCurrentUser } from "./lib/auth-session";
 import { supabase } from "./lib/supabase";
+import {
+  getEthereumAddressFromUser,
+  getFallbackDisplayName,
+} from "./lib/user-display";
 
 type Message = {
   id: number;
@@ -32,11 +37,6 @@ const MESSAGE_SELECT =
   "id, channel, username, content, created_at, user_id";
 
 const channels = ["general", "development", "random"];
-const DEFAULT_DISPLAY_NAME = "新用户";
-
-function getFallbackDisplayName(user: User) {
-  return user.email || DEFAULT_DISPLAY_NAME;
-}
 
 function formatMessageTime(createdAt: string) {
   const date = new Date(createdAt);
@@ -186,20 +186,21 @@ export default function Home() {
     let cancelled = false;
 
     async function restoreSession() {
-      const { data, error: sessionError } = await supabase.auth.getSession();
+      const { user: currentUser, errorMessage } =
+        await resolveCurrentUser(supabase);
 
       if (cancelled) {
         return;
       }
 
-      if (sessionError) {
-        setError(`读取登录状态失败：${sessionError.message}`);
+      if (errorMessage) {
+        setError(`读取登录状态失败：${errorMessage}`);
         setUser(null);
         setAuthReady(true);
         return;
       }
 
-      setUser(data.session?.user ?? null);
+      setUser(currentUser);
       setAuthReady(true);
     }
 
@@ -208,8 +209,28 @@ export default function Home() {
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, session) => {
-      setUser(session?.user ?? null);
-      setAuthReady(true);
+      if (!session) {
+        setUser(null);
+        setAuthReady(true);
+        return;
+      }
+
+      void resolveCurrentUser(supabase).then(
+        ({ user: currentUser, errorMessage }) => {
+          if (cancelled) {
+            return;
+          }
+
+          if (errorMessage) {
+            setError(`读取登录状态失败：${errorMessage}`);
+            setUser(null);
+          } else {
+            setUser(currentUser);
+          }
+
+          setAuthReady(true);
+        },
+      );
     });
 
     return () => {
@@ -542,10 +563,10 @@ export default function Home() {
                 {displayName}
               </div>
               <div
-                className="truncate text-xs text-gray-400"
-                title={user.email ?? undefined}
+                className="truncate text-xs font-mono text-gray-400"
+                title={getEthereumAddressFromUser(user) ?? undefined}
               >
-                {user.email ?? "Online"}
+                {getEthereumAddressFromUser(user) ?? "已登录"}
               </div>
             </div>
             <span className="shrink-0 text-xs text-indigo-300">编辑</span>

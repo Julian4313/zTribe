@@ -4,13 +4,13 @@ import {
   createServiceRoleSupabaseClient,
   createUserSupabaseClient,
 } from "../../lib/supabase-server";
+import { getFallbackDisplayName } from "../../lib/user-display";
 
 type CreateMessageBody = {
   channel?: unknown;
   content?: unknown;
 };
 
-const DEFAULT_DISPLAY_NAME = "新用户";
 const MESSAGE_SELECT =
   "id, channel, username, content, created_at, user_id";
 
@@ -92,9 +92,7 @@ export async function POST(request: Request) {
   }
 
   const username =
-    profile?.display_name?.trim() ||
-    user.email ||
-    DEFAULT_DISPLAY_NAME;
+    profile?.display_name?.trim() || getFallbackDisplayName(user);
 
   const writer = createServiceRoleSupabaseClient() ?? userClient;
 

@@ -5,7 +5,9 @@ import { useEffect, useState, type FormEvent } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import type { User } from "@supabase/supabase-js";
+import { resolveCurrentUser } from "../lib/auth-session";
 import { supabase } from "../lib/supabase";
+import { getEthereumAddressFromUser } from "../lib/user-display";
 
 type Profile = {
   id: string;
@@ -31,20 +33,21 @@ export default function ProfilePage() {
     let cancelled = false;
 
     async function restoreSession() {
-      const { data, error: sessionError } = await supabase.auth.getSession();
+      const { user: currentUser, errorMessage } =
+        await resolveCurrentUser(supabase);
 
       if (cancelled) {
         return;
       }
 
-      if (sessionError) {
-        setError(`读取登录状态失败：${sessionError.message}`);
+      if (errorMessage) {
+        setError(`读取登录状态失败：${errorMessage}`);
         setUser(null);
         setAuthReady(true);
         return;
       }
 
-      setUser(data.session?.user ?? null);
+      setUser(currentUser);
       setAuthReady(true);
     }
 
@@ -53,8 +56,28 @@ export default function ProfilePage() {
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, session) => {
-      setUser(session?.user ?? null);
-      setAuthReady(true);
+      if (!session) {
+        setUser(null);
+        setAuthReady(true);
+        return;
+      }
+
+      void resolveCurrentUser(supabase).then(
+        ({ user: currentUser, errorMessage }) => {
+          if (cancelled) {
+            return;
+          }
+
+          if (errorMessage) {
+            setError(`读取登录状态失败：${errorMessage}`);
+            setUser(null);
+          } else {
+            setUser(currentUser);
+          }
+
+          setAuthReady(true);
+        },
+      );
     });
 
     return () => {
@@ -234,9 +257,11 @@ export default function ProfilePage() {
         ) : (
           <form onSubmit={handleSave} className="space-y-4">
             <div>
-              <p className="text-xs font-bold uppercase text-gray-400">邮箱</p>
-              <p className="mt-2 truncate rounded bg-[#1e1f22] px-3 py-2.5 text-sm text-gray-300">
-                {user.email ?? "未设置邮箱"}
+              <p className="text-xs font-bold uppercase text-gray-400">
+                钱包地址
+              </p>
+              <p className="mt-2 truncate rounded bg-[#1e1f22] px-3 py-2.5 font-mono text-sm text-gray-300">
+                {getEthereumAddressFromUser(user) ?? "未绑定 EVM 钱包"}
               </p>
             </div>
 
