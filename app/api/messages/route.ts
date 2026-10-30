@@ -7,7 +7,7 @@ import { authorizeRoomPost } from "../../lib/room-post";
 import { getOrCreateWalletIdentity } from "../../lib/wallet-identity";
 
 
-type CreateMessageBody = { roomId?: unknown; content?: unknown; mediaKind?: unknown };
+type CreateMessageBody = { roomId?: unknown; content?: unknown; mediaKind?: unknown; replyTo?: unknown; replyToId?: unknown };
 const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
 const MAX_VOICE_SIZE = 10 * 1024 * 1024;
 const ALLOWED_VOICE_TYPES = new Set(["audio/webm", "audio/mp4", "audio/ogg", "audio/mpeg", "audio/wav", "audio/x-wav"]);
@@ -33,7 +33,7 @@ function imageExtension(type: string) {
   }
 }
 
-async function publicMessages(writer: SupabaseClient, rows: Record<string, unknown>[], viewerAuthorId: string) {
+async function publicMessages(writer: SupabaseClient, rows: Record<string, unknown>[], viewerAuthorId: string, viewerAddress: string): Promise<Record<string, unknown>[]> {
   const authorIds = [...new Set(rows.map((row) => typeof row.author_id === "string" ? row.author_id : null).filter((id): id is string => !!id))];
   const identitiesResult = authorIds.length
     ? await writer.schema("app").from("wallet_identities").select("id, wallet_address").in("id", authorIds)
@@ -58,12 +58,38 @@ async function publicMessages(writer: SupabaseClient, rows: Record<string, unkno
     if (item.path && item.signedUrl) signedByPath.set(item.path, item.signedUrl);
   }
 
+  const messageIds = rows.map((row) => row.id).filter((id): id is string => typeof id === "string");
+  const latestReplyIds = [...new Set(rows.map((row) => typeof row.latest_reply_id === "string" ? row.latest_reply_id : null).filter((id): id is string => !!id))];
+  const latestReplyResult = latestReplyIds.length
+    ? await writer.schema("app").from("messages").select("id, seq, room_id, author_id, kind, content, media_url, reply_to, created_at").in("id", latestReplyIds).is("deleted_at", null)
+    : { data: [], error: null };
+  if (latestReplyResult.error) throw new Error(`读取最新回复失败：${latestReplyResult.error.message}`);
+  const latestReplyRows = (latestReplyResult.data ?? []) as Record<string, unknown>[];
+  const latestReplyMessages: Record<string, unknown>[] = latestReplyRows.length
+    ? await publicMessages(writer, latestReplyRows, viewerAuthorId, viewerAddress)
+    : [];
+  const latestReplyById = new Map<string, Record<string, unknown>>(latestReplyMessages.map((message) => [String(message.id), message]));
+  const reactionsResult = messageIds.length ? await writer.schema("app").from("reactions").select("message_id, emoji, user_address").in("message_id", messageIds) : { data: [], error: null };
+  if (reactionsResult.error) throw new Error(`读取表情回应失败：${reactionsResult.error.message}`);
+  const reactionsByMessage = new Map<string, { emoji: string; count: number; mine: boolean }[]>();
+  for (const reaction of reactionsResult.data ?? []) {
+    const list = reactionsByMessage.get(reaction.message_id) ?? [];
+    const existing = list.find((item) => item.emoji === reaction.emoji);
+    if (existing) { existing.count += 1; existing.mine ||= reaction.user_address === viewerAddress; }
+    else list.push({ emoji: reaction.emoji, count: 1, mine: reaction.user_address === viewerAddress });
+    reactionsByMessage.set(reaction.message_id, list);
+  }
   return rows.map((row) => {
     const authorId = typeof row.author_id === "string" ? row.author_id : null;
     const address = authorId ? identityById.get(authorId) ?? null : null;
     const rawMediaPath = typeof row.media_url === "string" ? row.media_url : null;
     return {
-      id: row.id, seq: row.seq, room_id: row.room_id,
+      id: row.id, seq: row.seq, room_id: row.room_id, reply_to: row.reply_to ?? null,
+      reply_count: typeof row.reply_count === "number" ? row.reply_count : 0,
+      latest_reply_id: typeof row.latest_reply_id === "string" ? row.latest_reply_id : null,
+      latest_reply_at: typeof row.latest_reply_at === "string" ? row.latest_reply_at : null,
+      latest_reply: typeof row.latest_reply_id === "string" ? latestReplyById.get(row.latest_reply_id) ?? null : null,
+      reactions: reactionsByMessage.get(String(row.id)) ?? [],
       author_name: address ? nicknameByAddress.get(address) ?? "新用户" : "系统",
       is_mine: authorId === viewerAuthorId,
       kind: row.kind, content: row.content,
@@ -93,13 +119,37 @@ export async function GET(request: Request) {
     if (error) return NextResponse.json({ error: "验证房间权限失败。" }, { status: 500 });
     if (!access) return NextResponse.json({ error: "你没有读取这个房间的权限。" }, { status: 403 });
   }
+  const threadId = url.searchParams.get("threadId");
+  if (threadId) {
+    const { data: parent, error: parentError } = await writer.schema("app").from("messages")
+      .select("id, reply_count").eq("id", threadId).eq("room_id", roomId).is("deleted_at", null).maybeSingle();
+    if (parentError) return NextResponse.json({ error: "读取讨论原消息失败。" }, { status: 500 });
+    if (!parent) return NextResponse.json({ error: "讨论原消息不存在或已删除。" }, { status: 404 });
+
+    const threadLimit = Math.min(50, Math.max(1, Number(url.searchParams.get("limit") ?? 30) || 30));
+    const beforeThreadSeq = Number(url.searchParams.get("beforeSeq"));
+    let threadQuery = writer.schema("app").from("messages")
+      .select("id, seq, room_id, author_id, kind, content, media_url, reply_to, created_at")
+      .eq("room_id", roomId).eq("reply_to", threadId).is("deleted_at", null)
+      .order("seq", { ascending: false }).limit(threadLimit + 1);
+    if (Number.isFinite(beforeThreadSeq) && beforeThreadSeq > 0) threadQuery = threadQuery.lt("seq", beforeThreadSeq);
+    const { data: threadRows, error: threadError } = await threadQuery;
+    if (threadError) return NextResponse.json({ error: `加载讨论回复失败：${threadError.message}` }, { status: 500 });
+    const fetched = (threadRows ?? []) as Record<string, unknown>[];
+    const hasMore = fetched.length > threadLimit;
+    const pageRows = fetched.slice(0, threadLimit);
+    const threadMessages = await publicMessages(writer, pageRows, viewerAuthorId, auth.address);
+    const nextBeforeSeq = pageRows.length ? Math.min(...pageRows.map((row) => Number(row.seq))) : null;
+    return NextResponse.json({ messages: threadMessages, reply_count: parent.reply_count ?? 0, has_more: hasMore, next_before_seq: nextBeforeSeq }, { headers: { "Cache-Control": "private, no-store, max-age=0" } });
+  }
+
   const incremental = url.searchParams.has("afterSeq");
-  let query = writer.schema("app").from("messages").select("id, seq, room_id, author_id, kind, content, media_url, created_at").eq("room_id", roomId).is("deleted_at", null).order("seq", { ascending: incremental }).limit(limit);
+  let query = writer.schema("app").from("messages").select("id, seq, room_id, author_id, kind, content, media_url, reply_to, reply_count, latest_reply_id, latest_reply_at, created_at").eq("room_id", roomId).is("deleted_at", null).order("seq", { ascending: incremental }).limit(limit);
   if (Number.isFinite(beforeSeq) && beforeSeq > 0) query = query.lt("seq", beforeSeq);
   if (Number.isFinite(afterSeq) && afterSeq > 0) query = query.gt("seq", afterSeq);
   const { data, error } = await query;
   if (error) return NextResponse.json({ error: `加载消息失败：${error.message}` }, { status: 500 });
-  const messages = await publicMessages(writer, (data ?? []) as Record<string, unknown>[], viewerAuthorId);
+  const messages = await publicMessages(writer, (data ?? []) as Record<string, unknown>[], viewerAuthorId, auth.address);
   return NextResponse.json({ messages }, { headers: { "Cache-Control": "private, no-store, max-age=0" } });
 }
 
@@ -111,6 +161,7 @@ export async function POST(request: Request) {
   let content: string;
   let imageFile: File | null = null;
   let mediaKind: "image" | "voice" = "image";
+  let replyTo: string | null = null;
   try {
     if (contentType.includes("multipart/form-data")) {
       const form = await request.formData();
@@ -122,6 +173,8 @@ export async function POST(request: Request) {
       const body = await request.json() as CreateMessageBody;
       roomId = normalizeRoomId(typeof body.roomId === "string" ? body.roomId : "") ?? "";
       content = typeof body.content === "string" ? body.content.trim() : "";
+      const replyCandidate = body.replyToId ?? body.replyTo;
+      replyTo = typeof replyCandidate === "string" ? replyCandidate : null;
     }
   } catch { return NextResponse.json({ error: "无法解析发送内容。" }, { status: 400 }); }
   if (!roomId) return NextResponse.json({ error: "房间不存在。" }, { status: 400 });
@@ -148,13 +201,17 @@ export async function POST(request: Request) {
       mediaUrl = uploadedPath;
       content = content || (mediaKind === "voice" ? "语音消息" : "图片");
     }
+    if (replyTo) {
+      const { data: parent } = await writer.schema("app").from("messages").select("id").eq("id", replyTo).eq("room_id", roomId).is("deleted_at", null).maybeSingle();
+      if (!parent) return NextResponse.json({ error: "回复的消息不存在或已删除。" }, { status: 400 });
+    }
     const authorId = await getOrCreateWalletIdentity(writer, auth.address);
-    const { data, error } = await writer.schema("app").from("messages").insert({ room_id: roomId, author_id: authorId, kind: imageFile ? mediaKind : "text", source: "app", content, media_url: mediaUrl }).select("id, seq, room_id, author_id, kind, content, media_url, created_at").single();
+    const { data, error } = await writer.schema("app").from("messages").insert({ room_id: roomId, author_id: authorId, kind: imageFile ? mediaKind : "text", source: "app", content, media_url: mediaUrl, reply_to: replyTo }).select("id, seq, room_id, author_id, kind, content, media_url, reply_to, reply_count, latest_reply_id, latest_reply_at, created_at").single();
     if (error) {
       if (uploadedPath) await writer.storage.from(mediaKind === "voice" ? "chat-voice" : "chat-images").remove([uploadedPath]);
       return NextResponse.json({ error: `发送失败：${error.message}` }, { status: 500 });
     }
-    const [message] = await publicMessages(writer, [data as Record<string, unknown>], authorId);
+    const [message] = await publicMessages(writer, [data as Record<string, unknown>], authorId, auth.address);
     return NextResponse.json({ message }, { status: 201, headers: { "Cache-Control": "private, no-store, max-age=0" } });
   } catch (error) {
     if (uploadedPath) await writer.storage.from(mediaKind === "voice" ? "chat-voice" : "chat-images").remove([uploadedPath]).catch(() => undefined);

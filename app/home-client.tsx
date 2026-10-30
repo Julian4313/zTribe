@@ -37,7 +37,16 @@ type Message = {
   deliveryStatus?: "sending" | "failed";
   canRetry?: boolean;
   isMine?: boolean;
+  replyToId?: string | null;
+  replyCount?: number;
+  latestReplyId?: string | null;
+  latestReply?: { name: string; text: string; kind?: string } | null;
 };
+
+type ReactionPerson = { name: string; avatarUrl: string | null; createdAt: string; mine: boolean };
+type ReactionDetails = { messageId: string; emoji: string; people: ReactionPerson[]; offset: number; hasMore: boolean; loading: boolean; error: string | null; expanded: boolean };
+type ReactionItem = { emoji: string; count: number; mine: boolean };
+type ReactionMap = Record<string, ReactionItem[]>;
 
 type MessageRow = {
   id: string;
@@ -49,6 +58,16 @@ type MessageRow = {
   content: string;
   media_url: string | null;
   created_at: string;
+  reply_to?: string | null;
+  reply_count?: number;
+  latest_reply?: {
+    id: string;
+    author_name: string;
+    kind: string;
+    content: string;
+    created_at: string;
+    media_url?: string | null;
+  } | null;
 };
 
 
@@ -108,6 +127,7 @@ function normalizeMessageRow(value: unknown): MessageRow | null {
     typeof row.kind !== "string" ||
     typeof row.content !== "string" ||
     (row.media_url !== null && row.media_url !== undefined && typeof row.media_url !== "string") ||
+    (row.reply_to !== null && row.reply_to !== undefined && typeof row.reply_to !== "string") ||
     typeof row.created_at !== "string"
   ) {
     return null;
@@ -123,6 +143,16 @@ function normalizeMessageRow(value: unknown): MessageRow | null {
     kind: row.kind,
     content: row.content,
     media_url: typeof row.media_url === "string" ? row.media_url : null,
+    reply_to: typeof row.reply_to === "string" ? row.reply_to : null,
+    reply_count: typeof row.reply_count === "number" ? row.reply_count : 0,
+    latest_reply: row.latest_reply && typeof row.latest_reply === "object"
+      ? (() => {
+          const latest = row.latest_reply as Record<string, unknown>;
+          return typeof latest.id === "string" && typeof latest.author_name === "string" && typeof latest.kind === "string" && typeof latest.content === "string" && typeof latest.created_at === "string"
+            ? { id: latest.id, author_name: latest.author_name, kind: latest.kind, content: latest.content, created_at: latest.created_at, media_url: typeof latest.media_url === "string" ? latest.media_url : null }
+            : null;
+        })()
+      : null,
     created_at: row.created_at,
   };
 }
@@ -137,6 +167,14 @@ function mapRowToMessage(row: MessageRow): Message {
     kind: row.kind,
     mediaUrl: row.media_url,
     isMine: row.is_mine,
+    replyToId: row.reply_to ?? null,
+    replyCount: row.reply_count ?? 0,
+    latestReplyId: row.latest_reply?.id ?? null,
+    latestReply: row.latest_reply ? {
+      name: row.latest_reply.author_name || "用户",
+      text: row.latest_reply.content,
+      kind: row.latest_reply.kind,
+    } : null,
   };
 }
 
@@ -150,7 +188,42 @@ export default function Home() {
     normalizeRoomId(searchParams.get("room")) ?? WORLD_GENERAL;
   const [roomDraft, setRoomDraft] = useState("");
   const [input, setInput] = useState("");
+  const [replyTarget, setReplyTarget] = useState<Message | null>(null);
+  const [threadTarget, setThreadTarget] = useState<Message | null>(null);
+  const [threadReplies, setThreadReplies] = useState<Message[]>([]);
+  const [threadReplyCount, setThreadReplyCount] = useState(0);
+  const [threadBeforeSeq, setThreadBeforeSeq] = useState<number | null>(null);
+  const [hasEarlierThreadReplies, setHasEarlierThreadReplies] = useState(false);
+  const [isLoadingThreadReplies, setIsLoadingThreadReplies] = useState(false);
+  const [isLoadingEarlierThreadReplies, setIsLoadingEarlierThreadReplies] = useState(false);
+  const [threadLoadError, setThreadLoadError] = useState<string | null>(null);
+  const threadTargetRef = useRef<Message | null>(null);
+  threadTargetRef.current = threadTarget;
+
+  const threadCacheRef = useRef(new Map<string, {
+    replies: Message[];
+    count: number;
+    beforeSeq: number | null;
+    hasEarlier: boolean;
+    cachedAt: number;
+    stale: boolean;
+  }>());
+
+  const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
+  const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [reactionPickerFor, setReactionPickerFor] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
+  const messagesRef = useRef<Message[]>([]);
+  messagesRef.current = messages;
+  const [reactionMap, setReactionMap] = useState<ReactionMap>({});
+  const [reactionDetails, setReactionDetails] = useState<ReactionDetails | null>(null);
+  const reactionDetailsRef = useRef<ReactionDetails | null>(null);
+  reactionDetailsRef.current = reactionDetails;
+  const reactionHoverCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reactionLongPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const suppressReactionClickRef = useRef(false);
+  const [pendingReactions, setPendingReactions] = useState<Set<string>>(new Set());
+  const pendingReactionKeysRef = useRef(new Set<string>());
   const messagesRoomRef = useRef(activeRoom);
   const lastSeqRef = useRef(0);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
@@ -238,6 +311,8 @@ export default function Home() {
 
   useEffect(() => {
     activeRoomRef.current = activeRoom;
+    setReplyTarget(null);
+    setReactionPickerFor(null);
   }, [activeRoom]);
 
   useEffect(() => {
@@ -397,6 +472,99 @@ export default function Home() {
     };
   }, [activeRoom, user]);
 
+  useEffect(() => {
+    if (!user) { setReactionMap({}); return; }
+    const messageIds = messages.filter((message) => !message.id.startsWith("pending-")).map((message) => message.id).slice(-50);
+    if (!messageIds.length) { setReactionMap({}); return; }
+    let cancelled = false;
+    void (async () => {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session?.access_token) return;
+      const response = await fetch(`/api/reactions?roomId=${encodeURIComponent(activeRoom)}&messageIds=${messageIds.join(",")}`, { headers: { Authorization: `Bearer ${session.access_token}` }, cache: "no-store" });
+      const payload = await response.json().catch(() => null) as { reactions?: ReactionMap } | null;
+      if (!cancelled && response.ok) setReactionMap(payload?.reactions ?? {});
+    })();
+    return () => { cancelled = true; };
+  }, [activeRoom, user, messages]);
+
+  async function openReactionDetails(messageId: string, emoji: string) {
+    setReactionDetails({ messageId, emoji, people: [], offset: 0, hasMore: false, loading: true, error: null, expanded: false });
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session?.access_token) throw new Error("登录状态已失效");
+      const params = new URLSearchParams({ roomId: activeRoom, messageId, emoji, offset: "0" });
+      const response = await fetch(`/api/reactions?${params.toString()}`, { headers: { Authorization: `Bearer ${session.access_token}` }, cache: "no-store" });
+      const payload = await response.json().catch(() => null) as { people?: ReactionPerson[]; hasMore?: boolean; error?: string } | null;
+      if (!response.ok) throw new Error(payload?.error ?? "读取回应参与者失败");
+      setReactionDetails((current) => current?.messageId === messageId && current.emoji === emoji
+        ? { ...current, people: payload?.people ?? [], offset: payload?.people?.length ?? 0, hasMore: payload?.hasMore ?? false, loading: false }
+        : current);
+    } catch (error) {
+      setReactionDetails((current) => current?.messageId === messageId && current.emoji === emoji
+        ? { ...current, loading: false, error: error instanceof Error ? error.message : "读取回应参与者失败" }
+        : current);
+    }
+  }
+
+  async function loadMoreReactionPeople() {
+    if (!reactionDetails || reactionDetails.loading || !reactionDetails.hasMore) return;
+    const current = reactionDetails;
+    setReactionDetails({ ...current, loading: true, error: null });
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session?.access_token) throw new Error("登录状态已失效");
+      const params = new URLSearchParams({ roomId: activeRoom, messageId: current.messageId, emoji: current.emoji, offset: String(current.offset) });
+      const response = await fetch(`/api/reactions?${params.toString()}`, { headers: { Authorization: `Bearer ${session.access_token}` }, cache: "no-store" });
+      const payload = await response.json().catch(() => null) as { people?: ReactionPerson[]; hasMore?: boolean; error?: string } | null;
+      if (!response.ok) throw new Error(payload?.error ?? "读取更多参与者失败");
+      setReactionDetails((latest) => latest?.messageId === current.messageId && latest.emoji === current.emoji
+        ? { ...latest, people: [...latest.people, ...(payload?.people ?? [])], offset: current.offset + (payload?.people?.length ?? 0), hasMore: payload?.hasMore ?? false, loading: false }
+        : latest);
+    } catch (error) {
+      setReactionDetails((latest) => latest?.messageId === current.messageId && latest.emoji === current.emoji
+        ? { ...latest, loading: false, error: error instanceof Error ? error.message : "读取更多参与者失败" }
+        : latest);
+    }
+  }
+
+  async function toggleReaction(messageId: string, emoji: string) {
+    const key = `${messageId}:${emoji}`;
+    if (pendingReactionKeysRef.current.has(key)) return;
+    const previousItem = (reactionMap[messageId] ?? []).find((item) => item.emoji === emoji) ?? null;
+    pendingReactionKeysRef.current.add(key);
+    setPendingReactions((current) => new Set(current).add(key));
+    setReactionMap((current) => {
+      const next = { ...current };
+      const items = [...(next[messageId] ?? [])];
+      const index = items.findIndex((item) => item.emoji === emoji);
+      if (index >= 0) {
+        const item = { ...items[index], count: items[index].count + (items[index].mine ? -1 : 1), mine: !items[index].mine };
+        if (item.count <= 0) items.splice(index, 1); else items[index] = item;
+      } else items.push({ emoji, count: 1, mine: true });
+      next[messageId] = items;
+      return next;
+    });
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session?.access_token) throw new Error("登录状态已失效");
+      const response = await fetch("/api/reactions", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` }, body: JSON.stringify({ roomId: activeRoom, messageId, emoji }) });
+      const payload = await response.json().catch(() => null) as { error?: string } | null;
+      if (!response.ok) throw new Error(payload?.error ?? "互动更新失败");
+    } catch (err) {
+      setReactionMap((current) => {
+        const next = { ...current };
+        const items = [...(next[messageId] ?? [])].filter((item) => item.emoji !== emoji);
+        if (previousItem) items.push(previousItem);
+        if (items.length) next[messageId] = items; else delete next[messageId];
+        return next;
+      });
+      setError(err instanceof Error ? err.message : "互动更新失败，请重试。");
+    } finally {
+      pendingReactionKeysRef.current.delete(key);
+      setPendingReactions((current) => { const next = new Set(current); next.delete(key); return next; });
+    }
+  }
+
   // Poll the authenticated, sanitized message API. Raw messages are deliberately
   // not subscribed through Postgres Changes because that payload includes private columns.
   useEffect(() => {
@@ -441,13 +609,26 @@ export default function Home() {
               ? next.findIndex((message) =>
                   message.deliveryStatus === "sending" &&
                   message.text === row.content &&
-                  (message.kind ?? "text") === row.kind
+                  (message.kind ?? "text") === row.kind &&
+                  (message.replyToId ?? null) === (row.reply_to ?? null)
                 )
               : -1;
             if (pendingIndex >= 0) {
               next[pendingIndex] = confirmed;
             } else if (!next.some((message) => message.id === row.id)) {
               next.push(confirmed);
+            }
+            if (row.reply_to) {
+              const parentIndex = next.findIndex((message) => message.id === row.reply_to);
+              if (parentIndex >= 0 && next[parentIndex].latestReplyId !== row.id) {
+                const parent = next[parentIndex];
+                next[parentIndex] = {
+                  ...parent,
+                  replyCount: (parent.replyCount ?? 0) + 1,
+                  latestReplyId: row.id,
+                  latestReply: { name: confirmed.name, text: confirmed.text, kind: confirmed.kind },
+                };
+              }
             }
           }
           return next;
@@ -475,7 +656,123 @@ export default function Home() {
         schema: "app",
         table: "message_events",
         filter: `room_id=eq.${activeRoom}`,
-      }, () => { schedulePoll(250); })
+      }, () => {
+        schedulePoll(250);
+
+        // Invalidate discussion cache after a room message event.
+        const prefix = `${activeRoom}:`;
+        for (const [key, value] of threadCacheRef.current) {
+          if (key.startsWith(prefix)) value.stale = true;
+        }
+
+        // Refresh only the discussion currently open.
+        const openThread = threadTargetRef.current;
+        if (openThread && !openThread.id.startsWith("pending-")) {
+          void (async () => {
+            try {
+              const { data: { session } } = await supabase.auth.getSession();
+              if (!session?.access_token || cancelled) return;
+
+              const params = new URLSearchParams({
+                roomId: activeRoom,
+                threadId: openThread.id,
+                limit: "30",
+              });
+
+              const response = await fetch(`/api/messages?${params}`, {
+                headers: { Authorization: `Bearer ${session.access_token}` },
+                cache: "no-store",
+              });
+
+              const payload = await response.json().catch(() => null) as {
+                messages?: unknown[];
+                reply_count?: number;
+                has_more?: boolean;
+                next_before_seq?: number | null;
+              } | null;
+
+              if (!response.ok || cancelled) return;
+
+              const rows = (payload?.messages ?? [])
+                .map(normalizeMessageRow)
+                .filter((row): row is MessageRow => row !== null);
+
+              const replies = rows.reverse().map(mapRowToMessage);
+              const count = typeof payload?.reply_count === "number"
+                ? payload.reply_count : replies.length;
+              const beforeSeq = typeof payload?.next_before_seq === "number"
+                ? payload.next_before_seq
+                : (rows.length ? Math.min(...rows.map(row => row.seq)) : null);
+              const hasEarlier = payload?.has_more === true;
+
+              threadCacheRef.current.set(`${activeRoom}:${openThread.id}`, {
+                replies, count, beforeSeq, hasEarlier,
+                cachedAt: Date.now(),
+                stale: false,
+              });
+
+              if (threadTargetRef.current?.id === openThread.id) {
+                setThreadReplies(replies);
+                setThreadReplyCount(count);
+                setThreadBeforeSeq(beforeSeq);
+                setHasEarlierThreadReplies(hasEarlier);
+              }
+            } catch (error) {
+              console.error("Discussion realtime refresh failed:", error);
+            }
+          })();
+        }
+
+        // Reaction changes publish the same privacy-safe room event. Refresh
+        // aggregates through the authenticated API; never subscribe to raw
+        // reactions because that table contains wallet addresses.
+        void (async () => {
+          const messageIds = messagesRef.current
+            .filter((message) => !message.id.startsWith("pending-"))
+            .map((message) => message.id)
+            .slice(-50);
+          if (!messageIds.length) return;
+          const { data: { session } } = await supabase.auth.getSession();
+          if (!session?.access_token || cancelled) return;
+          const params = new URLSearchParams({ roomId: activeRoom, messageIds: messageIds.join(",") });
+          const response = await fetch(`/api/reactions?${params.toString()}`, {
+            headers: { Authorization: `Bearer ${session.access_token}` },
+            cache: "no-store",
+          });
+          const payload = await response.json().catch(() => null) as { reactions?: ReactionMap } | null;
+          if (!cancelled && response.ok) setReactionMap(payload?.reactions ?? {});
+
+          // Keep an open Slack-style participant preview/modal in sync too.
+          const detail = reactionDetailsRef.current;
+          if (detail) {
+            const detailParams = new URLSearchParams({
+              roomId: activeRoom,
+              messageId: detail.messageId,
+              emoji: detail.emoji,
+              offset: "0",
+            });
+            const detailResponse = await fetch(`/api/reactions?${detailParams.toString()}`, {
+              headers: { Authorization: `Bearer ${session.access_token}` },
+              cache: "no-store",
+            });
+            const detailPayload = await detailResponse.json().catch(() => null) as {
+              people?: ReactionPerson[]; hasMore?: boolean; error?: string;
+            } | null;
+            if (!cancelled && detailResponse.ok) {
+              setReactionDetails((current) => current?.messageId === detail.messageId && current.emoji === detail.emoji
+                ? {
+                    ...current,
+                    people: detailPayload?.people ?? [],
+                    offset: detailPayload?.people?.length ?? 0,
+                    hasMore: detailPayload?.hasMore ?? false,
+                    loading: false,
+                    error: null,
+                  }
+                : current);
+            }
+          }
+        })();
+      })
       .subscribe();
 
     // Realtime handles the fast path. The 15s foreground poll is only a recovery
@@ -496,6 +793,205 @@ export default function Home() {
       void supabase.removeChannel(subscription);
     };
   }, [activeRoom, user]);
+
+  
+  // Discussion cache: 30-second TTL, Realtime invalidation, lazy refresh.
+  useEffect(() => {
+    const targetId = threadTarget?.id;
+
+    if (!targetId || !user) {
+      setThreadReplies([]);
+      setThreadReplyCount(0);
+      setThreadBeforeSeq(null);
+      setHasEarlierThreadReplies(false);
+      setIsLoadingThreadReplies(false);
+      setThreadLoadError(null);
+      return;
+    }
+
+    let cancelled = false;
+    const room = activeRoom;
+    const key = `${room}:${targetId}`;
+    const cached = threadCacheRef.current.get(key);
+
+    if (cached && !cached.stale && Date.now() - cached.cachedAt < 30000) {
+      setThreadReplies(cached.replies);
+      setThreadReplyCount(cached.count);
+      setThreadBeforeSeq(cached.beforeSeq);
+      setHasEarlierThreadReplies(cached.hasEarlier);
+      setIsLoadingThreadReplies(false);
+      setThreadLoadError(null);
+      return () => { cancelled = true; };
+    }
+
+    setThreadReplies(cached?.replies ?? []);
+    setThreadReplyCount(cached?.count ?? threadTarget.replyCount ?? 0);
+    setThreadBeforeSeq(cached?.beforeSeq ?? null);
+    setHasEarlierThreadReplies(cached?.hasEarlier ?? false);
+    setIsLoadingThreadReplies(true);
+    setThreadLoadError(null);
+
+    void (async () => {
+      try {
+        const { data: { session } } = await supabase.auth.getSession();
+        if (!session?.access_token) {
+          throw new Error("登录状态已失效，请重新登录。");
+        }
+
+        const params = new URLSearchParams({
+          roomId: room,
+          threadId: targetId,
+          limit: "30",
+        });
+
+        const response = await fetch(`/api/messages?${params}`, {
+          headers: { Authorization: `Bearer ${session.access_token}` },
+          cache: "no-store",
+        });
+
+        const payload = await response.json().catch(() => null) as {
+          messages?: unknown[];
+          reply_count?: number;
+          has_more?: boolean;
+          next_before_seq?: number | null;
+          error?: string;
+        } | null;
+
+        if (!response.ok) {
+          throw new Error(payload?.error ?? "加载讨论回复失败。");
+        }
+
+        const rows = (payload?.messages ?? [])
+          .map(normalizeMessageRow)
+          .filter((row): row is MessageRow => row !== null);
+
+        const replies = rows.reverse().map(mapRowToMessage);
+        const count = typeof payload?.reply_count === "number"
+          ? payload.reply_count
+          : threadTarget.replyCount ?? replies.length;
+
+        const beforeSeq = typeof payload?.next_before_seq === "number"
+          ? payload.next_before_seq
+          : (rows.length ? Math.min(...rows.map(row => row.seq)) : null);
+
+        const hasEarlier = payload?.has_more === true;
+
+        if (cancelled || activeRoomRef.current !== room) return;
+
+        threadCacheRef.current.set(key, {
+          replies, count, beforeSeq, hasEarlier,
+          cachedAt: Date.now(),
+          stale: false,
+        });
+
+        setThreadReplies(replies);
+        setThreadReplyCount(count);
+        setThreadBeforeSeq(beforeSeq);
+        setHasEarlierThreadReplies(hasEarlier);
+
+      } catch (error) {
+        if (!cancelled) {
+          setThreadLoadError(
+            error instanceof Error ? error.message : "加载讨论回复失败。"
+          );
+        }
+      } finally {
+        if (!cancelled) setIsLoadingThreadReplies(false);
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [threadTarget?.id, activeRoom, user]);
+
+  async function loadEarlierThreadReplies() {
+    if (!threadTarget || threadBeforeSeq === null || isLoadingEarlierThreadReplies) return;
+
+    const roomAtStart = activeRoom;
+    const targetId = threadTarget.id;
+    const cursorAtStart = threadBeforeSeq;
+    const cacheKey = `${roomAtStart}:${targetId}`;
+
+    setIsLoadingEarlierThreadReplies(true);
+    setThreadLoadError(null);
+
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session?.access_token) {
+        throw new Error("登录状态已失效，请重新登录。");
+      }
+
+      const params = new URLSearchParams({
+        roomId: roomAtStart,
+        threadId: targetId,
+        limit: "30",
+        beforeSeq: String(cursorAtStart),
+      });
+
+      const response = await fetch(`/api/messages?${params.toString()}`, {
+        headers: { Authorization: `Bearer ${session.access_token}` },
+        cache: "no-store",
+      });
+
+      const payload = await response.json().catch(() => null) as {
+        messages?: unknown[];
+        has_more?: boolean;
+        next_before_seq?: number | null;
+        error?: string;
+      } | null;
+
+      if (!response.ok) {
+        throw new Error(payload?.error ?? "加载更早回复失败。");
+      }
+
+      if (
+        activeRoomRef.current !== roomAtStart ||
+        threadTargetRef.current?.id !== targetId
+      ) return;
+
+      const rows = (payload?.messages ?? [])
+        .map(normalizeMessageRow)
+        .filter((row): row is MessageRow => row !== null);
+
+      const olderReplies = rows.reverse().map(mapRowToMessage);
+      const known = new Set(threadReplies.map(item => item.id));
+      const mergedReplies = [
+        ...olderReplies.filter(item => !known.has(item.id)),
+        ...threadReplies,
+      ];
+
+      const nextBeforeSeq = typeof payload?.next_before_seq === "number"
+        ? payload.next_before_seq
+        : (rows.length ? Math.min(...rows.map(row => row.seq)) : null);
+
+      const hasEarlier = payload?.has_more === true;
+
+      // Update the complete cached thread, including all loaded pages.
+      threadCacheRef.current.set(cacheKey, {
+        replies: mergedReplies,
+        count: threadReplyCount,
+        beforeSeq: nextBeforeSeq,
+        hasEarlier,
+        cachedAt: Date.now(),
+        stale: false,
+      });
+
+      setThreadReplies(mergedReplies);
+      setThreadBeforeSeq(nextBeforeSeq);
+      setHasEarlierThreadReplies(hasEarlier);
+
+    } catch (err) {
+      if (
+        activeRoomRef.current === roomAtStart &&
+        threadTargetRef.current?.id === targetId
+      ) {
+        setThreadLoadError(
+          err instanceof Error ? err.message : "加载更早回复失败。"
+        );
+      }
+    } finally {
+      setIsLoadingEarlierThreadReplies(false);
+    }
+  }
 
   function selectRoom(roomId: string) {
     router.replace(`/?room=${roomId}`);
@@ -565,6 +1061,129 @@ export default function Home() {
     }
   }
 
+  async function jumpToMessage(messageId: string) {
+    const roomAtStart = activeRoomRef.current;
+    setError(null);
+
+    // Start with the messages already loaded for this room. If the target is
+    // older than the current window, fetch history pages until it is found.
+    let knownMessages = messagesRoomRef.current === roomAtStart ? [...messages] : [];
+    let cursor = oldestSeq;
+    let canLoadMore = hasEarlier;
+    let found = knownMessages.some((message) => message.id === messageId);
+
+    if (!found && cursor !== null && canLoadMore) {
+      if (loadEarlierLockRef.current) {
+        setError("正在加载历史消息，请稍后再试。");
+        return;
+      }
+
+      loadEarlierLockRef.current = true;
+      setIsLoadingEarlier(true);
+      try {
+        const { data: { session } } = await supabase.auth.getSession();
+        if (!session?.access_token) {
+          setError("请先登录后再查看这条消息。");
+          return;
+        }
+
+        const collectedPages: Message[] = [];
+        while (!found && canLoadMore && cursor !== null) {
+          const response = await fetch(
+            `/api/messages?roomId=${encodeURIComponent(roomAtStart)}&limit=${PAGE_SIZE + 1}&beforeSeq=${cursor}`,
+            {
+              headers: { Authorization: `Bearer ${session.access_token}` },
+              cache: "no-store",
+            },
+          );
+          const payload = await response.json().catch(() => null) as {
+            messages?: unknown[];
+            error?: string;
+          } | null;
+
+          if (activeRoomRef.current !== roomAtStart) return;
+          if (!response.ok) {
+            setError(payload?.error ?? "加载历史消息失败。");
+            return;
+          }
+
+          const fetchedRows = (payload?.messages ?? [])
+            .map((row) => normalizeMessageRow(row))
+            .filter((row): row is MessageRow => row !== null);
+          canLoadMore = fetchedRows.length > PAGE_SIZE;
+          const rows = fetchedRows.slice(0, PAGE_SIZE).reverse();
+
+          if (rows.length === 0) {
+            canLoadMore = false;
+            break;
+          }
+
+          const pageMessages = rows.map(mapRowToMessage);
+          // Pages arrive newest-to-oldest; prepend each older page so the
+          // accumulated list remains in chronological order.
+          collectedPages.unshift(...pageMessages);
+          knownMessages = [...pageMessages, ...knownMessages];
+          found = knownMessages.some((message) => message.id === messageId);
+          cursor = rows[0].seq;
+        }
+
+        if (activeRoomRef.current !== roomAtStart) return;
+        if (collectedPages.length > 0) {
+          setMessages((previous) => {
+            const ids = new Set(previous.map((message) => message.id));
+            const additions = collectedPages.filter((message) => !ids.has(message.id));
+            return [...additions, ...previous];
+          });
+        }
+        setOldestSeq(cursor);
+        setHasEarlier(canLoadMore);
+      } catch (err) {
+        if (activeRoomRef.current === roomAtStart) {
+          setError(
+            err instanceof Error
+              ? `加载历史消息失败：${err.message}`
+              : "加载历史消息失败，请重试。",
+          );
+        }
+        return;
+      } finally {
+        loadEarlierLockRef.current = false;
+        if (activeRoomRef.current === roomAtStart) setIsLoadingEarlier(false);
+      }
+    }
+
+    if (activeRoomRef.current !== roomAtStart) return;
+    if (!found && !knownMessages.some((message) => message.id === messageId)) {
+      setError("找不到这条消息，可能已被删除或不在当前房间。");
+      return;
+    }
+
+    // Give React time to commit prepended pages before looking up the DOM node.
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    if (activeRoomRef.current !== roomAtStart) return;
+
+    const target = document.getElementById(`message-${messageId}`);
+    if (!target) {
+      setError("消息已加载，但暂时无法定位到页面元素，请稍后重试。");
+      return;
+    }
+
+    setHighlightedMessageId(messageId);
+    target.scrollIntoView({ behavior: "smooth", block: "center" });
+    if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
+    highlightTimerRef.current = setTimeout(() => {
+      setHighlightedMessageId((current) =>
+        current === messageId ? null : current,
+      );
+      highlightTimerRef.current = null;
+    }, 1800);
+  }
+
+  useEffect(() => () => {
+    if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
+  }, []);
+
   function handleMessagesScroll() {
     const container = messagesContainerRef.current;
     if (!container) return;
@@ -591,13 +1210,15 @@ export default function Home() {
     event.preventDefault();
     const text = input.trim();
     if (!text || !canCompose) return;
+    const replyToId = replyTarget?.id ?? null;
     setInput("");
+    setReplyTarget(null);
     setIsEmojiOpen(false);
-    await submitMessage({ roomId: activeRoom, content: text, kind: "text" });
+    await submitMessage({ roomId: activeRoom, content: text, kind: "text", replyToId });
   }
 
   async function submitMessage(
-    args: { roomId: string; content: string; kind: "text" | "image" | "voice"; file?: File },
+    args: { roomId: string; content: string; kind: "text" | "image" | "voice"; file?: File; replyToId?: string | null },
     existingOptimisticId?: string,
     existingPreviewUrl?: string | null,
   ) {
@@ -622,6 +1243,7 @@ export default function Home() {
           system: false,
           kind,
           mediaUrl: localImageUrl,
+          replyToId: args.replyToId ?? null,
           deliveryStatus: "sending",
         },
       ]);
@@ -674,7 +1296,7 @@ export default function Home() {
               "Content-Type": "application/json",
               Authorization: `Bearer ${session.access_token}`,
             },
-            body: JSON.stringify({ roomId, content }),
+            body: JSON.stringify({ roomId, content, replyToId: args.replyToId ?? null }),
           });
         }
       } finally {
@@ -749,6 +1371,23 @@ export default function Home() {
         if (existingIndex >= 0) return previous;
         return [...previous, confirmedMessage];
       });
+      if (args.replyToId) {
+        setMessages((previous) => previous.map((message) => message.id === args.replyToId
+          ? message.latestReplyId === confirmedMessage.id
+            ? message
+            : {
+                ...message,
+                replyCount: (message.replyCount ?? 0) + 1,
+                latestReplyId: confirmedMessage.id,
+                latestReply: { name: confirmedMessage.name, text: confirmedMessage.text, kind: confirmedMessage.kind },
+              }
+          : message,
+        ));
+        if (threadTarget?.id === args.replyToId) {
+          setThreadReplyCount((count) => count + 1);
+          setThreadReplies((previous) => [...previous, confirmedMessage]);
+        }
+      }
     } catch (err) {
       setMessages((previous) => previous.map((message) =>
         message.id === optimisticId
@@ -769,7 +1408,7 @@ export default function Home() {
   async function handleImageSelected(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     event.target.value = "";
-    if (!file || !canCompose) return;
+    if (!file || !canCompose || replyTarget) return;
 
     const allowedTypes = ["image/jpeg", "image/png", "image/gif", "image/webp"];
     if (!allowedTypes.includes(file.type)) {
@@ -785,7 +1424,7 @@ export default function Home() {
   }
 
   async function startVoiceRecording() {
-    if (!canCompose || isRecordingVoice) return;
+    if (!canCompose || isRecordingVoice || replyTarget) return;
     if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
       setError("当前浏览器不支持语音录制，请使用最新版 Chrome、Edge 或 Safari。");
       return;
@@ -794,6 +1433,10 @@ export default function Home() {
     let stream: MediaStream | null = null;
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (replyTarget || !canCompose) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
       const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"];
       const mimeType = candidates.find((type) => MediaRecorder.isTypeSupported(type));
       const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
@@ -1037,7 +1680,15 @@ export default function Home() {
                   {message.text}
                 </p>
               ) : (
-                <article key={message.id} className="flex gap-3">
+                <article
+                  key={message.id}
+                  id={`message-${message.id}`}
+                  className={`flex gap-3 rounded-lg transition-colors duration-500 ${
+                    highlightedMessageId === message.id
+                      ? "bg-indigo-500/15 outline outline-2 outline-indigo-400/80"
+                      : ""
+                  }`}
+                >
                   <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-indigo-500 font-bold">
                     {message.name[0]?.toUpperCase() ?? "?"}
                   </div>
@@ -1063,6 +1714,27 @@ export default function Home() {
                       )}
                     </div>
 
+                    {message.replyToId && (() => {
+                      const original = visibleMessages.find((item) => item.id === message.replyToId);
+                      const preview = !original
+                        ? "原消息（可能尚未加载）"
+                        : original.kind === "image"
+                          ? "图片消息"
+                          : original.kind === "voice"
+                            ? "语音消息"
+                            : original.text;
+                      return (
+                        <button
+                          type="button"
+                          onClick={() => void jumpToMessage(message.replyToId!)}
+                          className="mb-2 block max-w-full rounded-r border-l-2 border-indigo-400 bg-white/5 px-3 py-2 text-left text-xs text-gray-400 hover:bg-white/10 hover:text-gray-200"
+                          title="跳转到原消息"
+                        >
+                          <span className="block font-medium text-indigo-300">回复 {original?.name ?? "原消息"}</span>
+                          <span className="block max-w-xl truncate">{preview}</span>
+                        </button>
+                      );
+                    })()}
                     {message.kind === "image" && message.mediaUrl ? (
                       <div className="mt-2">
                         <img
@@ -1081,6 +1753,154 @@ export default function Home() {
                     ) : (
                       <p className="whitespace-pre-wrap break-words text-gray-200">{message.text}</p>
                     )}
+                    <div className="mt-2 flex flex-wrap items-center gap-2">
+                      {(reactionMap[message.id] ?? []).map((reaction) => (
+                        <div
+                          key={reaction.emoji}
+                          className="relative inline-flex"
+                          onMouseEnter={() => {
+                            if (reactionHoverCloseTimerRef.current) clearTimeout(reactionHoverCloseTimerRef.current);
+                            if (reactionDetails?.messageId !== message.id || reactionDetails.emoji !== reaction.emoji) {
+                              void openReactionDetails(message.id, reaction.emoji);
+                            }
+                          }}
+                          onMouseLeave={() => {
+                            if (reactionHoverCloseTimerRef.current) clearTimeout(reactionHoverCloseTimerRef.current);
+                            reactionHoverCloseTimerRef.current = setTimeout(() => {
+                              setReactionDetails((current) => current?.expanded ? current : null);
+                            }, 220);
+                          }}
+                          onTouchStart={() => {
+                            suppressReactionClickRef.current = false;
+                            if (reactionLongPressTimerRef.current) clearTimeout(reactionLongPressTimerRef.current);
+                            reactionLongPressTimerRef.current = setTimeout(() => {
+                              suppressReactionClickRef.current = true;
+                              void openReactionDetails(message.id, reaction.emoji);
+                            }, 480);
+                          }}
+                          onTouchEnd={() => {
+                            if (reactionLongPressTimerRef.current) clearTimeout(reactionLongPressTimerRef.current);
+                            reactionLongPressTimerRef.current = null;
+                          }}
+                          onTouchCancel={() => {
+                            if (reactionLongPressTimerRef.current) clearTimeout(reactionLongPressTimerRef.current);
+                            reactionLongPressTimerRef.current = null;
+                          }}
+                        >
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (suppressReactionClickRef.current) {
+                                suppressReactionClickRef.current = false;
+                                return;
+                              }
+                              void toggleReaction(message.id, reaction.emoji);
+                            }}
+                            disabled={message.deliveryStatus === "sending" || message.deliveryStatus === "failed" || pendingReactions.has(`${message.id}:${reaction.emoji}`)}
+                            title="点击添加或取消反应；悬停或长按查看参与者"
+                            aria-label={`${reaction.emoji}，${reaction.count} 个反应。点击切换反应，悬停或长按查看参与者`}
+                            className={`rounded-full border px-2 py-1 text-xs transition ${reaction.mine ? "border-indigo-400 bg-indigo-500/20 text-indigo-200" : "border-white/10 bg-white/5 text-gray-300"} disabled:opacity-50`}
+                          >
+                            {reaction.emoji} {reaction.count}{pendingReactions.has(`${message.id}:${reaction.emoji}`) ? " · 同步中" : ""}
+                          </button>
+                          {reactionDetails?.messageId === message.id && reactionDetails.emoji === reaction.emoji && !reactionDetails.expanded && (
+                            <div className="absolute bottom-full left-0 z-40 mb-2 w-64 rounded-xl border border-white/10 bg-[#202127] p-2.5 text-left shadow-2xl" role="tooltip">
+                              <div className="mb-2 flex items-center justify-between gap-2 border-b border-white/10 pb-2">
+                                <span className="text-xs font-semibold text-gray-200">{reaction.emoji} 谁回应了</span>
+                                <span className="text-[11px] text-gray-500">{reaction.count} 人</span>
+                              </div>
+                              {reactionDetails.people.slice(0, 5).map((person, index) => (
+                                <div key={`${person.name}-${person.createdAt}-${index}`} className="flex items-center gap-2 py-1">
+                                  {person.avatarUrl ? <img src={person.avatarUrl} alt="" className="h-6 w-6 rounded-full object-cover" /> : <div className="flex h-6 w-6 items-center justify-center rounded-full bg-indigo-500/30 text-[10px] font-semibold text-indigo-200">{person.name.slice(0, 1).toUpperCase()}</div>}
+                                  <span className="min-w-0 flex-1 truncate text-xs text-gray-200">{person.name}{person.mine ? <span className="ml-1 text-indigo-300">（你）</span> : null}</span>
+                                </div>
+                              ))}
+                              {reactionDetails.loading && <p className="py-2 text-center text-xs text-gray-400">正在加载…</p>}
+                              {reactionDetails.error && <p className="py-2 text-xs text-red-300">{reactionDetails.error}</p>}
+                              {!reactionDetails.loading && !reactionDetails.error && reactionDetails.people.length === 0 && <p className="py-2 text-xs text-gray-400">暂时没有回应者。</p>}
+                              {(reactionDetails.hasMore || reactionDetails.people.length > 5) && <button type="button" onClick={() => setReactionDetails((current) => current ? { ...current, expanded: true } : current)} className="mt-1 w-full rounded-md border-t border-white/10 pt-2 text-center text-xs text-indigo-300 hover:text-indigo-200">查看全部参与者</button>}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                      <button type="button" onClick={() => void toggleReaction(message.id, "👍")} disabled={message.deliveryStatus === "sending" || message.deliveryStatus === "failed" || pendingReactions.has(`${message.id}:👍`)} className="rounded-full border border-white/10 px-2 py-1 text-xs text-gray-400 hover:bg-white/10 disabled:opacity-50">👍{pendingReactions.has(`${message.id}:👍`) ? " 同步中" : ""}</button>
+                      <button type="button" onClick={() => void toggleReaction(message.id, "❤️")} disabled={message.deliveryStatus === "sending" || message.deliveryStatus === "failed" || pendingReactions.has(`${message.id}:❤️`)} className="rounded-full border border-white/10 px-2 py-1 text-xs text-gray-400 hover:bg-white/10 disabled:opacity-50">❤️{pendingReactions.has(`${message.id}:❤️`) ? " 同步中" : ""}</button>
+                      <button type="button" onClick={() => void toggleReaction(message.id, "😂")} disabled={message.deliveryStatus === "sending" || message.deliveryStatus === "failed" || pendingReactions.has(`${message.id}:😂`)} className="rounded-full border border-white/10 px-2 py-1 text-xs text-gray-400 hover:bg-white/10 disabled:opacity-50">😂{pendingReactions.has(`${message.id}:😂`) ? " 同步中" : ""}</button>
+                      <div className="relative">
+                        <button type="button" onClick={() => setReactionPickerFor((current) => current === message.id ? null : message.id)} disabled={message.deliveryStatus === "sending" || message.deliveryStatus === "failed"} className="px-1 py-1 text-xs text-gray-500 hover:text-indigo-300 disabled:opacity-40">更多表情</button>
+                        {reactionPickerFor === message.id && (
+                          <div className="absolute bottom-full left-0 z-20 mb-2 grid w-64 grid-cols-8 gap-1 rounded-xl border border-white/10 bg-[#24262b] p-2 shadow-xl">
+                            {EMOJI_OPTIONS.map((emoji) => (
+                              <button key={emoji} type="button" onClick={() => { setReactionPickerFor(null); void toggleReaction(message.id, emoji); }} disabled={message.deliveryStatus === "sending" || message.deliveryStatus === "failed" || pendingReactions.has(`${message.id}:${emoji}`)} className="rounded p-1.5 text-lg hover:bg-white/10 disabled:opacity-40" aria-label={`对消息添加 ${emoji} 反应`}>{emoji}</button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                      {(!message.kind || message.kind === "text") && (
+                        <button
+                          type="button"
+                          onClick={() => setReplyTarget(message)}
+                          disabled={message.deliveryStatus === "sending" || message.deliveryStatus === "failed" || isRecordingVoice}
+                          className="px-1 py-1 text-xs text-gray-500 hover:text-indigo-300 disabled:opacity-40"
+                        >
+                          回复
+                        </button>
+                      )}
+                    </div>
+                    {(!message.kind || message.kind === "text") && (() => {
+                      // Use the room's complete in-memory message collection rather
+                      // than visibleMessages, which may be a filtered/windowed view.
+                      // Show the discussion entry only when the server or loaded
+                      // timeline confirms at least one reply exists.
+                      const replies = messages.filter((item) => item.replyToId === message.id);
+                      const latestReply = message.latestReply ?? replies[replies.length - 1] ?? null;
+                      const replyCount = Math.max(message.replyCount ?? 0, replies.length);
+                      const participants = Array.from(
+                        new Map(replies.map((reply) => [reply.name, reply])).values(),
+                      ).slice(0, 3);
+                      const latestPreview = latestReply
+                        ? latestReply.kind === "image"
+                          ? "图片消息"
+                          : latestReply.kind === "voice"
+                            ? "语音消息"
+                            : latestReply.text
+                        : null;
+                      return replyCount > 0 ? (
+                        <button
+                          type="button"
+                          onClick={() => setThreadTarget(message)}
+                          className="mt-2 flex max-w-full flex-col items-start gap-1.5 rounded-lg border border-white/5 bg-white/[0.035] px-2.5 py-2 text-left transition hover:border-indigo-400/30 hover:bg-white/[0.07]"
+                          title="打开完整讨论"
+                          aria-label={`打开关于这条消息的 ${replyCount} 条回复`}
+                        >
+                          <span className="flex items-center gap-2">
+                            {participants.length > 0 && (
+                              <span className="flex -space-x-1.5">
+                                {participants.map((participant) => (
+                                  <span
+                                    key={participant.name}
+                                    className="flex h-5 w-5 items-center justify-center rounded-full border-2 border-[#292b31] bg-indigo-500 text-[9px] font-semibold text-white"
+                                    title={participant.name}
+                                  >
+                                    {participant.name[0]?.toUpperCase() ?? "?"}
+                                  </span>
+                                ))}
+                              </span>
+                            )}
+                            <span className="text-xs font-semibold text-indigo-300">
+                              {replyCount > 0 ? `${replyCount} 条回复` : "讨论"}
+                            </span>
+                            <span className="text-[11px] text-gray-500">查看讨论 ›</span>
+                          </span>
+                          {latestReply && latestPreview !== null && (
+                            <span className="block max-w-full truncate text-xs text-gray-400">
+                              <span className="text-gray-300">最新回复 · {latestReply.name}：</span>
+                              {latestPreview}
+                            </span>
+                          )}
+                        </button>
+                      ) : null;
+                    })()}
                   </div>
                 </article>
               ),
@@ -1092,6 +1912,141 @@ export default function Home() {
             </p>
           )}
         </div>
+
+        {threadTarget && (
+          <>
+            <button
+              type="button"
+              aria-label="关闭讨论面板"
+              onClick={() => setThreadTarget(null)}
+              className="absolute inset-0 z-20 bg-black/35"
+            />
+            <aside
+              className="absolute inset-y-0 right-0 z-30 flex w-full max-w-md flex-col border-l border-white/10 bg-[#24262b] shadow-2xl"
+              aria-label="消息讨论"
+              aria-modal="true"
+              role="dialog"
+            >
+              <header className="flex h-14 shrink-0 items-center justify-between border-b border-white/10 px-4">
+                <div className="min-w-0">
+                  <h2 className="font-semibold text-white">讨论</h2>
+                  <p className="text-xs text-gray-500">
+                    {isLoadingThreadReplies ? "正在加载回复…" : `${threadReplyCount} 条回复`}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setThreadTarget(null)}
+                  className="rounded-lg p-2 text-gray-400 hover:bg-white/10 hover:text-white"
+                  aria-label="关闭讨论"
+                >
+                  ✕
+                </button>
+              </header>
+
+              <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
+                <div className="rounded-xl border border-indigo-400/25 bg-indigo-500/[0.07] p-3">
+                  <div className="mb-2 flex items-center gap-2 text-xs text-gray-400">
+                    <span className="flex h-7 w-7 items-center justify-center rounded-full bg-indigo-500 font-semibold text-white">
+                      {threadTarget.name[0]?.toUpperCase() ?? "?"}
+                    </span>
+                    <span className="font-semibold text-gray-200">{threadTarget.name}</span>
+                    <span>{threadTarget.time}</span>
+                    <span className="ml-auto text-indigo-300">原消息</span>
+                  </div>
+                  <p className="whitespace-pre-wrap break-words text-sm text-gray-100">
+                    {threadTarget.kind === "image"
+                      ? "🖼️ 图片消息"
+                      : threadTarget.kind === "voice"
+                        ? "🎙️ 语音消息"
+                        : threadTarget.text}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setThreadTarget(null);
+                      void jumpToMessage(threadTarget.id);
+                    }}
+                    className="mt-2 text-xs text-indigo-300 hover:text-indigo-200"
+                  >
+                    在聊天中查看原消息
+                  </button>
+                </div>
+
+                <div className="flex items-center gap-2 text-xs font-semibold text-gray-400">
+                  <span>回复</span>
+                  <span className="h-px flex-1 bg-white/10" />
+                </div>
+
+                {isLoadingThreadReplies && (
+                  <p className="py-8 text-center text-sm text-gray-500">正在加载回复…</p>
+                )}
+
+                {threadLoadError && (
+                  <p className="rounded-lg bg-red-500/10 px-3 py-2 text-sm text-red-300">{threadLoadError}</p>
+                )}
+
+                {hasEarlierThreadReplies && (
+                  <button
+                    type="button"
+                    onClick={() => void loadEarlierThreadReplies()}
+                    disabled={isLoadingEarlierThreadReplies}
+                    className="w-full rounded-lg px-3 py-2 text-center text-xs font-medium text-indigo-300 hover:bg-white/5 disabled:opacity-50"
+                  >
+                    {isLoadingEarlierThreadReplies ? "正在加载…" : "加载更早的回复"}
+                  </button>
+                )}
+
+                {!isLoadingThreadReplies && !threadLoadError && threadReplies
+                  .map((reply) => (
+                    <button
+                      key={reply.id}
+                      type="button"
+                      onClick={() => {
+                        setThreadTarget(null);
+                        void jumpToMessage(reply.id);
+                      }}
+                      className="block w-full rounded-lg px-2 py-2 text-left transition hover:bg-white/5"
+                    >
+                      <span className="mb-1 flex items-center gap-2 text-xs">
+                        <span className="flex h-7 w-7 items-center justify-center rounded-full bg-[#41444c] font-semibold text-gray-200">
+                          {reply.name[0]?.toUpperCase() ?? "?"}
+                        </span>
+                        <span className="font-semibold text-gray-200">{reply.name}</span>
+                        <span className="text-gray-500">{reply.time}</span>
+                        <span className="ml-auto text-gray-600">查看消息 ↗</span>
+                      </span>
+                      <span className="ml-9 block whitespace-pre-wrap break-words text-sm text-gray-300">
+                        {reply.kind === "image"
+                          ? "🖼️ 图片消息"
+                          : reply.kind === "voice"
+                            ? "🎙️ 语音消息"
+                            : reply.text}
+                      </span>
+                    </button>
+                  ))}
+
+                {!isLoadingThreadReplies && !threadLoadError && threadReplies.length === 0 && (
+                  <p className="py-8 text-center text-sm text-gray-500">这条消息还没有回复。</p>
+                )}
+              </div>
+
+              <div className="shrink-0 border-t border-white/10 p-3">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setReplyTarget(threadTarget);
+                    setThreadTarget(null);
+                  }}
+                  disabled={!canCompose || isRecordingVoice}
+                  className="w-full rounded-lg bg-indigo-500 px-4 py-3 text-sm font-semibold text-white transition hover:bg-indigo-400 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  回复这条讨论
+                </button>
+              </div>
+            </aside>
+          </>
+        )}
 
         {!isAtBottom && (
           <button
@@ -1105,6 +2060,29 @@ export default function Home() {
         )}
 
         <form onSubmit={sendMessage} className="px-5 pb-6">
+          {replyTarget && (
+            <div className="mb-2 flex items-center justify-between gap-3 rounded-r border-l-2 border-indigo-400 bg-white/5 px-3 py-2 text-sm">
+              <div className="min-w-0">
+                <p className="text-xs font-medium text-indigo-300">回复 {replyTarget.name}</p>
+                <p className="truncate text-gray-300">
+                  {replyTarget.kind === "image"
+                    ? "图片消息"
+                    : replyTarget.kind === "voice"
+                      ? "语音消息"
+                      : replyTarget.text}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setReplyTarget(null)}
+                className="shrink-0 rounded p-1 text-gray-400 hover:bg-white/10 hover:text-white"
+                aria-label="取消回复"
+                title="取消回复"
+              >
+                ✕
+              </button>
+            </div>
+          )}
           <div className="relative flex items-center gap-2 rounded-lg bg-[#383a40] px-3">
             <button
               type="button"
@@ -1116,46 +2094,58 @@ export default function Home() {
             >
               😊
             </button>
-            <input
-              ref={imageInputRef}
-              type="file"
-              accept="image/png,image/jpeg,image/gif,image/webp"
-              onChange={(event) => void handleImageSelected(event)}
-              className="hidden"
-              aria-label="选择图片"
-            />
-            <button
-              type="button"
-              onClick={() => imageInputRef.current?.click()}
-              disabled={!canCompose}
-              aria-label="发送图片"
-              title="发送图片（最大 10 MB）"
-              className="rounded p-2 text-xl text-gray-300 hover:bg-white/10 hover:text-white disabled:opacity-50"
-            >
-              <svg viewBox="0 0 24 24" aria-hidden="true" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="1.8">
-                <rect x="3" y="3" width="18" height="18" rx="3" />
-                <circle cx="8.5" cy="8.5" r="1.5" />
-                <path d="m21 15-5-5L5 21" />
-              </svg>
-            </button>
+            {!replyTarget && (
+              <>
+                <input
+                  ref={imageInputRef}
+                  type="file"
+                  accept="image/png,image/jpeg,image/gif,image/webp"
+                  onChange={(event) => void handleImageSelected(event)}
+                  className="hidden"
+                  aria-label="选择图片"
+                />
+                <button
+                  type="button"
+                  onClick={() => imageInputRef.current?.click()}
+                  disabled={!canCompose}
+                  aria-label="发送图片"
+                  title="发送图片（最大 10 MB）"
+                  className="rounded p-2 text-xl text-gray-300 hover:bg-white/10 hover:text-white disabled:opacity-50"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="1.8">
+                    <rect x="3" y="3" width="18" height="18" rx="3" />
+                    <circle cx="8.5" cy="8.5" r="1.5" />
+                    <path d="m21 15-5-5L5 21" />
+                  </svg>
+                </button>
+              </>
+            )}
             <input
               value={input}
               onChange={(event) => setInput(event.target.value)}
-              placeholder={canCompose ? `发送到 #${title}` : "当前房间不能发言"}
-              aria-label={`发送到 #${title}`}
+              placeholder={
+                !canCompose
+                  ? "当前房间不能发言"
+                  : replyTarget
+                    ? `回复 ${replyTarget.name}...`
+                    : `发送到 #${title}`
+              }
+              aria-label={replyTarget ? `回复 ${replyTarget.name}` : `发送到 #${title}`}
               disabled={!canCompose}
               className="min-w-0 flex-1 bg-transparent py-4 text-white outline-none placeholder:text-gray-400 disabled:opacity-60"
             />
-            <button
-              type="button"
-              onClick={() => isRecordingVoice ? stopVoiceRecording() : void startVoiceRecording()}
-              disabled={!canCompose}
-              aria-label={isRecordingVoice ? "结束并发送语音" : "录制语音"}
-              title={isRecordingVoice ? "结束并发送语音" : "录制语音（最长 2 分钟）"}
-              className={`rounded p-2 text-xl hover:bg-white/10 disabled:opacity-50 ${isRecordingVoice ? "text-red-400" : "text-gray-300 hover:text-white"}`}
-            >
-              {isRecordingVoice ? "⏹" : "🎙️"}
-            </button>
+            {!replyTarget && (
+              <button
+                type="button"
+                onClick={() => isRecordingVoice ? stopVoiceRecording() : void startVoiceRecording()}
+                disabled={!canCompose}
+                aria-label={isRecordingVoice ? "结束并发送语音" : "录制语音"}
+                title={isRecordingVoice ? "结束并发送语音" : "录制语音（最长 2 分钟）"}
+                className={`rounded p-2 text-xl hover:bg-white/10 disabled:opacity-50 ${isRecordingVoice ? "text-red-400" : "text-gray-300 hover:text-white"}`}
+              >
+                {isRecordingVoice ? "⏹" : "🎙️"}
+              </button>
+            )}
             <button
               type="submit"
               disabled={!canCompose || input.trim().length === 0}
@@ -1180,9 +2170,39 @@ export default function Home() {
               </div>
             )}
           </div>
-          <p className="mt-2 px-1 text-xs text-gray-500">图片支持 JPG、PNG、GIF、WebP（单张最大 10 MB）；语音最长 2 分钟、最大 10 MB。录音需允许浏览器访问麦克风。</p>
+          <p className="mt-2 px-1 text-xs text-gray-500">
+            {replyTarget
+              ? "回复仅支持文字和 Emoji。"
+              : "图片支持 JPG、PNG、GIF、WebP（单张最大 10 MB）；语音最长 2 分钟、最大 10 MB。录音需允许浏览器访问麦克风。"}
+          </p>
         </form>
       </section>
+      {reactionDetails?.expanded && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setReactionDetails(null); }}>
+          <section role="dialog" aria-modal="true" aria-labelledby="reaction-details-title" className="w-full max-w-sm overflow-hidden rounded-xl border border-white/10 bg-[#2b2d31] shadow-2xl">
+            <header className="flex items-center justify-between border-b border-white/10 px-4 py-3">
+              <h2 id="reaction-details-title" className="font-semibold">{reactionDetails.emoji} 谁回应了这条消息</h2>
+              <button type="button" onClick={() => setReactionDetails(null)} className="rounded px-2 py-1 text-gray-400 hover:bg-white/10 hover:text-white" aria-label="关闭">✕</button>
+            </header>
+            <div className="max-h-80 overflow-y-auto p-2">
+              {reactionDetails.people.map((person, index) => (
+                <div key={`${person.name}-${person.createdAt}-${index}`} className="flex items-center gap-3 rounded-lg px-2 py-2 hover:bg-white/5">
+                  {person.avatarUrl ? <img src={person.avatarUrl} alt="" className="h-9 w-9 rounded-full object-cover" /> : <div className="flex h-9 w-9 items-center justify-center rounded-full bg-indigo-500/30 font-semibold text-indigo-200">{person.name.slice(0, 1).toUpperCase()}</div>}
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-sm font-medium">{person.name}{person.mine && <span className="ml-2 text-xs text-indigo-300">你</span>}</div>
+                    <div className="text-xs text-gray-500">{new Date(person.createdAt).toLocaleString()}</div>
+                  </div>
+                  {person.mine && <button type="button" onClick={() => { void toggleReaction(reactionDetails.messageId, reactionDetails.emoji); setReactionDetails(null); }} className="text-xs text-indigo-300 hover:text-indigo-200">取消</button>}
+                </div>
+              ))}
+              {reactionDetails.loading && <p className="px-3 py-4 text-center text-sm text-gray-400">正在加载…</p>}
+              {reactionDetails.error && <p className="px-3 py-3 text-sm text-red-300">{reactionDetails.error}</p>}
+              {!reactionDetails.loading && !reactionDetails.error && reactionDetails.people.length === 0 && <p className="px-3 py-4 text-center text-sm text-gray-400">暂时没有回应者。</p>}
+            </div>
+            {reactionDetails.hasMore && <footer className="border-t border-white/10 p-3"><button type="button" onClick={() => void loadMoreReactionPeople()} disabled={reactionDetails.loading} className="w-full rounded-lg bg-white/5 px-3 py-2 text-sm text-gray-200 hover:bg-white/10 disabled:opacity-50">加载更多</button></footer>}
+          </section>
+        </div>
+      )}
     </main>
   );
 }
