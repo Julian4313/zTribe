@@ -71,9 +71,11 @@ export function getEthereumAddressFromUser(user: User): string | null {
 }
 
 export function getFallbackDisplayName(user: User) {
-  const address = getEthereumAddressFromUser(user);
-  if (address) {
-    return shortenEthereumAddress(address);
+  // Never derive a public-facing fallback nickname from the wallet address.
+  // Supabase's internal user UUID is stable for this account and unrelated
+  // to the wallet string shown in the UI.
+  if (typeof user.id === "string" && user.id.length >= 4) {
+    return `User_${user.id.slice(-6).toUpperCase()}`;
   }
 
   return DEFAULT_DISPLAY_NAME;

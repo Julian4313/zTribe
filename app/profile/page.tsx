@@ -2,89 +2,30 @@
 "use client";
 
 import { useEffect, useState, type FormEvent } from "react";
-import Link from "next/link";
 import { useRouter } from "next/navigation";
 import type { User } from "@supabase/supabase-js";
-import { resolveCurrentUser } from "../lib/auth-session";
 import { supabase } from "../lib/supabase";
+import { useAuthUser } from "../lib/use-auth-user";
 import { getEthereumAddressFromUser } from "../lib/user-display";
 
-type Profile = {
-  id: string;
-  display_name: string;
-  avatar_url: string | null;
-  updated_at: string;
-};
-
-const DEFAULT_DISPLAY_NAME = "新用户";
 const MAX_DISPLAY_NAME_LENGTH = 40;
 
 export default function ProfilePage() {
   const router = useRouter();
-  const [user, setUser] = useState<User | null>(null);
-  const [authReady, setAuthReady] = useState(false);
-  const [isLoadingProfile, setIsLoadingProfile] = useState(true);
+  const { user, authReady } = useAuthUser();
+  // Initialize from navigation data on the very first render. This keeps
+  // both the nickname and the wallet address visible immediately; the wallet
+  // address is already available from the authenticated user and is not read
+  // from the profiles table.
+  const [initialNickname] = useState(() => {
+    if (typeof window === "undefined") return "";
+    return new URLSearchParams(window.location.search).get("nickname")?.trim() ?? "";
+  });
+  const [isLoadingProfile, setIsLoadingProfile] = useState(() => !initialNickname);
   const [isSaving, setIsSaving] = useState(false);
-  const [displayName, setDisplayName] = useState(DEFAULT_DISPLAY_NAME);
+  const [displayName, setDisplayName] = useState(initialNickname);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function restoreSession() {
-      const { user: currentUser, errorMessage } =
-        await resolveCurrentUser(supabase);
-
-      if (cancelled) {
-        return;
-      }
-
-      if (errorMessage) {
-        setError(`读取登录状态失败：${errorMessage}`);
-        setUser(null);
-        setAuthReady(true);
-        return;
-      }
-
-      setUser(currentUser);
-      setAuthReady(true);
-    }
-
-    void restoreSession();
-
-    const {
-      data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, session) => {
-      if (!session) {
-        setUser(null);
-        setAuthReady(true);
-        return;
-      }
-
-      void resolveCurrentUser(supabase).then(
-        ({ user: currentUser, errorMessage }) => {
-          if (cancelled) {
-            return;
-          }
-
-          if (errorMessage) {
-            setError(`读取登录状态失败：${errorMessage}`);
-            setUser(null);
-          } else {
-            setUser(currentUser);
-          }
-
-          setAuthReady(true);
-        },
-      );
-    });
-
-    return () => {
-      cancelled = true;
-      subscription.unsubscribe();
-    };
-  }, []);
 
   useEffect(() => {
     if (!authReady) {
@@ -104,15 +45,38 @@ export default function ProfilePage() {
     let cancelled = false;
 
     async function loadOrCreateProfile(currentUser: User) {
-      setIsLoadingProfile(true);
       setError(null);
       setSuccess(null);
+      try {
 
-      const { data: existing, error: loadError } = await supabase
-        .from("profiles")
-        .select("id, display_name, avatar_url, updated_at")
-        .eq("id", currentUser.id)
-        .maybeSingle();
+      // The chat sidebar already has the current nickname. Reuse it when
+      // navigating here instead of making the user wait for a duplicate read.
+      const nicknameFromNavigation = new URLSearchParams(window.location.search)
+        .get("nickname")?.trim();
+      if (nicknameFromNavigation) {
+        setDisplayName(nicknameFromNavigation.slice(0, MAX_DISPLAY_NAME_LENGTH));
+        setIsLoadingProfile(false);
+        return;
+      }
+
+      setIsLoadingProfile(true);
+      const address = getEthereumAddressFromUser(currentUser)?.toLowerCase();
+      if (!address) {
+        setError("当前会话没有钱包地址。");
+        setIsLoadingProfile(false);
+        return;
+      }
+
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session?.access_token) {
+        setError("登录状态已失效，请重新登录。");
+        setIsLoadingProfile(false);
+        return;
+      }
+      const profileResponse = await fetch("/api/profile", { headers: { Authorization: `Bearer ${session.access_token}` } });
+      const profilePayload = await profileResponse.json().catch(() => null) as { profile?: { nickname?: string | null }; error?: string } | null;
+      const existing = profilePayload?.profile ?? null;
+      const loadError = profileResponse.ok ? null : new Error(profilePayload?.error ?? "读取资料失败。");
 
       if (cancelled) {
         return;
@@ -124,34 +88,49 @@ export default function ProfilePage() {
         return;
       }
 
-      if (existing) {
-        setDisplayName(existing.display_name);
+      const existingNickname =
+        typeof existing?.nickname === "string" ? existing.nickname.trim() : "";
+
+      if (existingNickname) {
+        setDisplayName(existingNickname);
         setIsLoadingProfile(false);
         return;
       }
 
-      const { data: created, error: createError } = await supabase
-        .from("profiles")
-        .insert({
-          id: currentUser.id,
-          display_name: DEFAULT_DISPLAY_NAME,
-        })
-        .select("id, display_name, avatar_url, updated_at")
-        .single();
-
-      if (cancelled) {
-        return;
-      }
-
-      if (createError) {
-        setError(`创建资料失败：${createError.message}`);
+      // Stable per-wallet default. The API's initializeOnly mode inserts only
+      // when absent, so opening two tabs cannot overwrite a chosen nickname.
+      const defaultNickname = `User_${currentUser.id.slice(-6).toUpperCase()}`;
+      const response = await fetch("/api/profile", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify({ nickname: defaultNickname, initializeOnly: true }),
+      });
+      const payload = await response.json().catch(() => null) as
+        | { error?: string; profile?: { nickname?: string | null } }
+        | null;
+      if (cancelled) return;
+      if (!response.ok) {
+        setError(payload?.error ?? "创建默认昵称失败，请稍后重试。");
         setIsLoadingProfile(false);
         return;
       }
 
-      const profile = created as Profile;
-      setDisplayName(profile.display_name);
+      const savedName = typeof payload?.profile?.nickname === "string"
+        ? payload.profile.nickname
+        : defaultNickname;
+      setDisplayName(savedName);
       setIsLoadingProfile(false);
+      } catch (loadError) {
+        if (!cancelled) {
+          setError(loadError instanceof Error
+            ? `加载资料失败：${loadError.message}`
+            : "加载资料失败，请检查网络后重试。");
+          setIsLoadingProfile(false);
+        }
+      }
     }
 
     void loadOrCreateProfile(user);
@@ -185,36 +164,64 @@ export default function ProfilePage() {
     setError(null);
     setSuccess(null);
 
-    const {
-      data: { user: authUser },
-      error: authError,
-    } = await supabase.auth.getUser();
+    try {
+      const {
+        data: { user: authUser },
+        error: authError,
+      } = await supabase.auth.getUser();
 
-    if (authError || !authUser) {
+      if (authError || !authUser) {
+        setError("登录状态已失效，请重新登录。");
+        await supabase.auth.signOut();
+        router.replace("/login");
+        return;
+      }
+
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+
+      if (!session?.access_token) {
+        setError("登录状态已失效，请重新登录。");
+        await supabase.auth.signOut();
+        router.replace("/login");
+        return;
+      }
+
+      const response = await fetch("/api/profile", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify({ nickname: trimmedName }),
+        cache: "no-store",
+      });
+      const payload = (await response.json().catch(() => null)) as
+        | { error?: string; profile?: { nickname?: string | null } }
+        | null;
+
+      if (!response.ok) {
+        setError(payload?.error ?? "保存失败，请稍后重试。");
+        return;
+      }
+
+      const savedName = typeof payload?.profile?.nickname === "string"
+        ? payload.profile.nickname.trim()
+        : trimmedName;
+      setDisplayName(savedName);
+      setSuccess("保存成功，正在返回聊天室…");
+      // Pass the confirmed server value back to the chat page so its sidebar
+      // can update immediately without waiting for another profile request.
+      await new Promise((resolve) => window.setTimeout(resolve, 350));
+      router.replace(`/?nickname=${encodeURIComponent(savedName)}`);
+    } catch (saveError) {
+      setError(saveError instanceof Error
+        ? `保存失败：${saveError.message}`
+        : "保存失败，请检查网络后重试。");
+    } finally {
       setIsSaving(false);
-      setError("请先登录后再编辑资料。");
-      setUser(null);
-      router.replace("/login");
-      return;
     }
-
-    const { error: updateError } = await supabase
-      .from("profiles")
-      .update({
-        display_name: trimmedName,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", authUser.id);
-
-    setIsSaving(false);
-
-    if (updateError) {
-      setError(`保存失败：${updateError.message}`);
-      return;
-    }
-
-    setDisplayName(trimmedName);
-    setSuccess("资料已保存。");
   }
 
   if (!authReady || !user) {
@@ -244,12 +251,14 @@ export default function ProfilePage() {
             </p>
           </div>
 
-          <Link
-            href="/"
-            className="shrink-0 rounded bg-[#404249] px-3 py-1.5 text-sm hover:bg-[#35373c]"
+          <button
+            type="button"
+            disabled={isSaving}
+            onClick={() => router.replace("/")}
+            className="shrink-0 rounded bg-[#404249] px-3 py-1.5 text-sm hover:bg-[#35373c] disabled:cursor-not-allowed disabled:opacity-40"
           >
             返回聊天
-          </Link>
+          </button>
         </div>
 
         {isLoadingProfile ? (
@@ -300,11 +309,19 @@ export default function ProfilePage() {
               disabled={!canSave}
               className="w-full rounded bg-indigo-500 px-4 py-2.5 font-medium hover:bg-indigo-400 disabled:cursor-not-allowed disabled:opacity-50"
             >
-              {isSaving ? "保存中..." : "保存资料"}
+              {isSaving ? "正在保存…" : success ? "保存成功" : "保存资料"}
             </button>
           </form>
         )}
       </div>
+      {isSaving && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 backdrop-blur-[2px]" aria-live="polite">
+          <div className="flex items-center gap-3 rounded-lg bg-[#2b2d31] px-5 py-4 text-sm shadow-xl">
+            <span className="h-4 w-4 animate-spin rounded-full border-2 border-gray-500 border-t-white" />
+            正在保存资料，请稍候…
+          </div>
+        </div>
+      )}
     </main>
   );
 }

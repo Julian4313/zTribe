@@ -1,68 +1,34 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
 import { getBrowserEthereumProvider } from "../lib/ethereum-window";
 import { supabase } from "../lib/supabase";
+import { useAuthUser } from "../lib/use-auth-user";
+import { getEthereumAddressFromUser } from "../lib/user-display";
 
 const SIGN_IN_STATEMENT =
   "授权登录 zTribe 聊天室。签名仅用于验证钱包所有权，不会发起链上交易。";
 
 export default function LoginPage() {
   const router = useRouter();
+  const { user, authReady } = useAuthUser();
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [authChecking, setAuthChecking] = useState(true);
-  const [hasWallet, setHasWallet] = useState<boolean | null>(null);
+  const hasWallet = useSyncExternalStore(
+    () => () => {},
+    () => getBrowserEthereumProvider() !== null,
+    () => null,
+  );
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    setHasWallet(getBrowserEthereumProvider() !== null);
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function restoreSession() {
-      const { data, error: sessionError } = await supabase.auth.getSession();
-
-      if (cancelled) {
-        return;
-      }
-
-      if (sessionError) {
-        setError(`读取登录状态失败：${sessionError.message}`);
-        setAuthChecking(false);
-        return;
-      }
-
-      if (data.session) {
-        router.replace("/");
-        return;
-      }
-
-      setAuthChecking(false);
+    if (authReady && user && !isSubmitting) {
+      router.replace("/");
     }
-
-    void restoreSession();
-
-    const {
-      data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, session) => {
-      if (session) {
-        router.replace("/");
-      }
-    });
-
-    return () => {
-      cancelled = true;
-      subscription.unsubscribe();
-    };
-  }, [router]);
+  }, [authReady, user, router]);
 
   async function handleWalletSignIn() {
-    if (isSubmitting) {
-      return;
-    }
+    if (isSubmitting) return;
 
     const provider = getBrowserEthereumProvider();
     if (!provider) {
@@ -75,44 +41,116 @@ export default function LoginPage() {
     setIsSubmitting(true);
     setError(null);
 
-    const { error: signInError } = await supabase.auth.signInWithWeb3({
-      chain: "ethereum",
-      statement: SIGN_IN_STATEMENT,
-    });
+    try {
+      const { error: signInError } = await supabase.auth.signInWithWeb3({
+        chain: "ethereum",
+        statement: SIGN_IN_STATEMENT,
+      });
 
-    setIsSubmitting(false);
+      if (signInError) {
+        const message = signInError.message || "未知登录错误";
+        const normalized = message.toLowerCase();
+        const errorCode = String(
+          (signInError as { code?: string | number }).code ?? "",
+        ).toLowerCase();
 
-    if (signInError) {
-      const message = signInError.message.toLowerCase();
+        if (
+          errorCode === "4001" ||
+          errorCode === "action_rejected" ||
+          normalized.includes("user rejected") ||
+          normalized.includes("user denied") ||
+          normalized.includes("rejected") ||
+          normalized.includes("denied")
+        ) {
+          setError("你已取消钱包签名，未完成登录。需要登录时，可以再次点击按钮。 ");
+          return;
+        }
 
-      if (
-        message.includes("user rejected") ||
-        message.includes("rejected") ||
-        message.includes("denied")
-      ) {
-        setError("你已取消钱包签名，未完成登录。");
+        if (
+          normalized.includes("web3") ||
+          normalized.includes("provider") ||
+          normalized.includes("not enabled")
+        ) {
+          setError(
+            `登录失败：${message}。请在 Supabase 控制台启用 Authentication → Providers → Web3（Ethereum），并将 http://localhost:3000/** 加入 Redirect URLs。`,
+          );
+          return;
+        }
+
+        setError(`登录失败：${message}`);
         return;
       }
 
-      if (
-        message.includes("web3") ||
-        message.includes("provider") ||
-        message.includes("not enabled")
-      ) {
-        setError(
-          `登录失败：${signInError.message}。请在 Supabase 控制台启用 Authentication → Providers → Web3（Ethereum），并将 http://localhost:3000/** 加入 Redirect URLs。`,
-        );
+      // Create the user's default nickname before entering the chat. This is
+      // deliberately part of the successful login flow, not an edit-page action.
+      const {
+        data: { session },
+        error: sessionError,
+      } = await supabase.auth.getSession();
+      if (sessionError || !session?.access_token || !session.user) {
+        await supabase.auth.signOut();
+        setError("登录成功，但无法读取登录凭证。请重新连接钱包。");
         return;
       }
 
-      setError(`登录失败：${signInError.message}`);
-      return;
+      const address = getEthereumAddressFromUser(session.user)?.toLowerCase();
+      if (!address) {
+        await supabase.auth.signOut();
+        setError("登录成功，但未能读取钱包地址。请重新连接钱包。");
+        return;
+      }
+
+      const defaultNickname = `User_${session.user.id.slice(-6).toUpperCase()}`;
+      const profileResponse = await fetch("/api/profile", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify({ nickname: defaultNickname, initializeOnly: true }),
+      });
+      const profilePayload = await profileResponse.json().catch(() => null) as
+        | { error?: string }
+        | null;
+
+      if (!profileResponse.ok) {
+        await supabase.auth.signOut();
+        setError(profilePayload?.error ?? "默认昵称创建失败，请稍后重试登录。");
+        return;
+      }
+
+      router.replace("/");
+    } catch (caughtError) {
+      const errorObject = caughtError as {
+        message?: string;
+        code?: string | number;
+        shortMessage?: string;
+      } | null;
+      const message =
+        errorObject?.shortMessage ||
+        errorObject?.message ||
+        (typeof caughtError === "string" ? caughtError : "未知登录错误");
+      const normalized = message.toLowerCase();
+      const errorCode = String(errorObject?.code ?? "").toLowerCase();
+
+      if (
+        errorCode === "4001" ||
+        errorCode === "action_rejected" ||
+        normalized.includes("user rejected") ||
+        normalized.includes("user denied") ||
+        normalized.includes("rejected") ||
+        normalized.includes("denied")
+      ) {
+        setError("你已取消钱包签名，未完成登录。需要登录时，可以再次点击按钮。");
+      } else {
+        setError(`登录失败：${message}`);
+      }
+    } finally {
+      setIsSubmitting(false);
     }
-
-    router.replace("/");
   }
 
-  if (authChecking) {
+  if (!authReady || user) {
     return (
       <main className="flex min-h-screen items-center justify-center bg-[#313338] text-white">
         <p className="text-gray-400">正在检查登录状态...</p>

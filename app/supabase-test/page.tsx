@@ -11,7 +11,8 @@ export default function SupabaseTestPage() {
     setStatus("正在连接...");
 
     const { error } = await supabase
-      .from("messages")
+      .schema("app")
+      .from("rooms")
       .select("id")
       .limit(1);
 
@@ -20,7 +21,7 @@ export default function SupabaseTestPage() {
       return;
     }
 
-    setStatus("连接成功！已成功读取 messages 表。");
+      setStatus("连接成功！已成功读取 app.rooms。");
   }
 
   return (
