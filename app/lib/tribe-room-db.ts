@@ -97,6 +97,76 @@ export type TribeGateSnapshot = {
   allowed: boolean;
 };
 
+export type MyTribeEntry = {
+  tokenAddress: string;
+  title: string;
+  balance: string;
+  requiredTokens: string | null;
+  allowed: boolean;
+};
+
+/** 当前钱包在 DB 快照里持仓 > 0 的 Tribe（token_address = room id）。 */
+export async function loadMyTribes(
+  writer: SupabaseClient,
+  walletAddress: string,
+): Promise<MyTribeEntry[]> {
+  const wallet = walletAddress.toLowerCase();
+
+  const { data: balances, error: balanceError } = await app(writer)
+    .from("wallet_token_balances")
+    .select("token_address, balance")
+    .eq("wallet_address", wallet);
+
+  if (balanceError) {
+    throw new Error(balanceError.message);
+  }
+
+  const held = (balances ?? []).filter(
+    (row) =>
+      isTribeRoom(row.token_address) &&
+      parseTokenAmount(row.balance) > BigInt(0),
+  );
+
+  if (held.length === 0) {
+    return [];
+  }
+
+  const tokens = held.map((row) => row.token_address);
+  const { data: rooms, error: roomError } = await app(writer)
+    .from("rooms")
+    .select("id, title, required_tokens")
+    .in("id", tokens);
+
+  if (roomError) {
+    throw new Error(roomError.message);
+  }
+
+  const roomById = new Map(
+    (rooms ?? []).map((room) => [room.id as string, room]),
+  );
+
+  const entries: MyTribeEntry[] = held.map((row) => {
+    const token = row.token_address;
+    const room = roomById.get(token);
+    const balance = parseTokenAmount(row.balance);
+    const minimum = parseTokenAmount(room?.required_tokens ?? 0);
+    const rawTitle =
+      typeof room?.title === "string" ? room.title.trim() : "";
+
+    return {
+      tokenAddress: token,
+      title: rawTitle && rawTitle !== token ? rawTitle : token,
+      balance: balance.toString(),
+      requiredTokens:
+        room?.required_tokens != null ? String(room.required_tokens) : null,
+      allowed: balance >= minimum,
+    };
+  });
+
+  entries.sort((a, b) => a.title.localeCompare(b.title));
+  return entries;
+}
+
 export async function loadTribeGateSnapshot(
   writer: SupabaseClient,
   tokenAddress: string,

@@ -92,6 +92,41 @@ const sidebarRooms = [
   WORLD_CORE,
 ];
 
+type MyTribeEntry = {
+  tokenAddress: string;
+  title: string;
+  balance: string;
+  requiredTokens: string | null;
+  allowed: boolean;
+};
+
+const TRIBE_READ_PERMISSION_ERROR = "你没有读取这个房间的权限。";
+
+async function postTribeRoomAccess(roomId: string, accessToken: string) {
+  const response = await fetch("/api/rooms/access", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify({ roomId }),
+  });
+  const payload = (await response.json().catch(() => null)) as
+    | { error?: string }
+    | null;
+  return {
+    ok: response.ok,
+    error: payload?.error ?? "还不能进入这个部落。",
+  };
+}
+
+function tribeListLabel(entry: MyTribeEntry) {
+  if (entry.title !== entry.tokenAddress) {
+    return entry.title;
+  }
+  return roomTitle(entry.tokenAddress);
+}
+
 function formatMessageTime(createdAt: string) {
   const date = new Date(createdAt);
   const time = date.toLocaleTimeString([], {
@@ -249,6 +284,10 @@ export default function Home() {
   const [hasEarlier, setHasEarlier] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [canCompose, setCanCompose] = useState(true);
+  const canComposeRef = useRef(canCompose);
+  canComposeRef.current = canCompose;
+  const [myTribes, setMyTribes] = useState<MyTribeEntry[]>([]);
+  const [isLoadingMyTribes, setIsLoadingMyTribes] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [savedNickname, setSavedNickname] = useState<{
     address: string;
@@ -372,6 +411,49 @@ export default function Home() {
   }, [walletAddress]);
 
   useEffect(() => {
+    if (!user || !walletAddress) {
+      setMyTribes([]);
+      return;
+    }
+
+    let cancelled = false;
+    setIsLoadingMyTribes(true);
+
+    void (async () => {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      if (!session?.access_token || cancelled) {
+        if (!cancelled) setIsLoadingMyTribes(false);
+        return;
+      }
+
+      const response = await fetch("/api/tribes/mine", {
+        headers: { Authorization: `Bearer ${session.access_token}` },
+        cache: "no-store",
+      });
+      const payload = (await response.json().catch(() => null)) as
+        | { tribes?: MyTribeEntry[]; error?: string }
+        | null;
+
+      if (cancelled) {
+        return;
+      }
+
+      if (response.ok) {
+        setMyTribes(payload?.tribes ?? []);
+      } else {
+        setMyTribes([]);
+      }
+      setIsLoadingMyTribes(false);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [user, walletAddress]);
+
+  useEffect(() => {
     if (!user) {
       return;
     }
@@ -379,8 +461,14 @@ export default function Home() {
     let cancelled = false;
 
     async function loadRoom() {
+      const tribeRoom = isTribeRoom(activeRoom);
       const cachedEntry = roomMessagesCache.get(activeRoom);
-      const cachedRoom = cachedEntry && Date.now() - cachedEntry.cachedAt < 45 * 60 * 1000 ? cachedEntry : undefined;
+      const cachedRoom =
+        !tribeRoom &&
+        cachedEntry &&
+        Date.now() - cachedEntry.cachedAt < 45 * 60 * 1000
+          ? cachedEntry
+          : undefined;
       if (!cachedRoom) roomMessagesCache.delete(activeRoom);
       lastSeqRef.current = cachedRoom?.latestSeq ?? 0;
       // Never carry the previous room's write permission into a new room.
@@ -389,8 +477,7 @@ export default function Home() {
       setMessages(cachedRoom?.messages ?? []);
       setOldestSeq(cachedRoom?.oldestSeq ?? null);
       setHasEarlier(cachedRoom?.hasEarlier ?? false);
-      // Only show the full loading placeholder when this room has no cache.
-      setIsLoading(!cachedRoom);
+      setIsLoading(tribeRoom ? true : !cachedRoom);
       setIsLoadingEarlier(false);
       setError(null);
       setNewMessagesCount(0);
@@ -406,37 +493,30 @@ export default function Home() {
         return;
       }
 
-      if (isTribeRoom(activeRoom)) {
-        const {
-          data: { session },
-        } = await supabase.auth.getSession();
+      const {
+        data: { session: accessSession },
+      } = await supabase.auth.getSession();
 
-        if (!session?.access_token) {
+      if (tribeRoom) {
+        if (!accessSession?.access_token) {
           setCanCompose(false);
           setError("请先登录后再进入部落。");
           setIsLoading(false);
           return;
         }
 
-        const response = await fetch("/api/rooms/access", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${session.access_token}`,
-          },
-          body: JSON.stringify({ roomId: activeRoom }),
-        });
-        const payload = (await response.json().catch(() => null)) as
-          | { error?: string }
-          | null;
+        const access = await postTribeRoomAccess(
+          activeRoom,
+          accessSession.access_token,
+        );
 
         if (cancelled) {
           return;
         }
 
-        if (!response.ok) {
+        if (!access.ok) {
           setCanCompose(false);
-          setError(payload?.error ?? "还不能进入这个部落。");
+          setError(access.error);
           setIsLoading(false);
           return;
         }
@@ -444,12 +524,55 @@ export default function Home() {
 
       setCanCompose(true);
 
-      const { data: { session: messageSession } } = await supabase.auth.getSession();
-      if (!messageSession?.access_token) { setIsLoading(false); setError("登录状态已失效，请重新登录。"); return; }
-      const historyResponse = await fetch(`/api/messages?roomId=${encodeURIComponent(activeRoom)}&limit=${PAGE_SIZE + 1}`, { headers: { Authorization: `Bearer ${messageSession.access_token}` }, cache: "no-store" });
-      const historyPayload = await historyResponse.json().catch(() => null) as { messages?: unknown[]; error?: string } | null;
+      if (!accessSession?.access_token) {
+        setIsLoading(false);
+        setError("登录状态已失效，请重新登录。");
+        return;
+      }
+
+      let historyResponse = await fetch(
+        `/api/messages?roomId=${encodeURIComponent(activeRoom)}&limit=${PAGE_SIZE + 1}`,
+        {
+          headers: { Authorization: `Bearer ${accessSession.access_token}` },
+          cache: "no-store",
+        },
+      );
+      let historyPayload = (await historyResponse.json().catch(() => null)) as
+        | { messages?: unknown[]; error?: string }
+        | null;
+
+      if (
+        tribeRoom &&
+        historyResponse.status === 403 &&
+        historyPayload?.error === TRIBE_READ_PERMISSION_ERROR
+      ) {
+        const retryAccess = await postTribeRoomAccess(
+          activeRoom,
+          accessSession.access_token,
+        );
+        if (retryAccess.ok) {
+          historyResponse = await fetch(
+            `/api/messages?roomId=${encodeURIComponent(activeRoom)}&limit=${PAGE_SIZE + 1}`,
+            {
+              headers: {
+                Authorization: `Bearer ${accessSession.access_token}`,
+              },
+              cache: "no-store",
+            },
+          );
+          historyPayload = (await historyResponse.json().catch(() => null)) as
+            | { messages?: unknown[]; error?: string }
+            | null;
+        }
+      }
+
       if (cancelled) return;
-      if (!historyResponse.ok) { setCanCompose(false); setError(historyPayload?.error ?? "加载消息失败。"); setIsLoading(false); return; }
+      if (!historyResponse.ok) {
+        setCanCompose(false);
+        setError(historyPayload?.error ?? "加载消息失败。");
+        setIsLoading(false);
+        return;
+      }
       const fetchedRows = (historyPayload?.messages ?? [])
         .map((row) => normalizeMessageRow(row))
         .filter((row): row is MessageRow => row !== null);
@@ -474,6 +597,10 @@ export default function Home() {
 
   useEffect(() => {
     if (!user) { setReactionMap({}); return; }
+    if (isTribeRoom(activeRoom) && !canComposeRef.current) {
+      setReactionMap({});
+      return;
+    }
     const messageIds = messages.filter((message) => !message.id.startsWith("pending-")).map((message) => message.id).slice(-50);
     if (!messageIds.length) { setReactionMap({}); return; }
     let cancelled = false;
@@ -569,6 +696,7 @@ export default function Home() {
   // not subscribed through Postgres Changes because that payload includes private columns.
   useEffect(() => {
     if (!user || activeRoom === WORLD_CORE) return;
+    if (isTribeRoom(activeRoom) && !canComposeRef.current) return;
     let cancelled = false;
     let inFlight = false;
     let pollAgain = false;
@@ -816,7 +944,7 @@ export default function Home() {
       if (debounceTimer) clearTimeout(debounceTimer);
       void supabase.removeChannel(subscription);
     };
-  }, [activeRoom, user]);
+  }, [activeRoom, user, canCompose]);
 
   
   // Discussion cache: 30-second TTL, Realtime invalidation, lazy refresh.
@@ -1565,7 +1693,24 @@ export default function Home() {
   const displayName = profileDisplayName ?? getFallbackDisplayName(user);
   const avatarLetter = displayName[0]?.toUpperCase() ?? "?";
   const title = roomTitle(activeRoom);
-  const tribeRooms = isTribeRoom(activeRoom) ? [activeRoom] : [];
+  const sidebarTribeIds = new Set(myTribes.map((entry) => entry.tokenAddress));
+  if (isTribeRoom(activeRoom)) {
+    sidebarTribeIds.add(activeRoom);
+  }
+  const sidebarTribes: MyTribeEntry[] = [...sidebarTribeIds].map((tokenAddress) => {
+    const fromList = myTribes.find((entry) => entry.tokenAddress === tokenAddress);
+    if (fromList) {
+      return fromList;
+    }
+    return {
+      tokenAddress,
+      title: tokenAddress,
+      balance: "0",
+      requiredTokens: null,
+      allowed: canCompose && activeRoom === tokenAddress,
+    };
+  });
+  sidebarTribes.sort((a, b) => tribeListLabel(a).localeCompare(tribeListLabel(b)));
   const visibleMessages = messagesRoomRef.current === activeRoom ? messages : [];
 
   return (
@@ -1606,17 +1751,35 @@ export default function Home() {
             Tribe
           </p>
 
-          {tribeRooms.map((roomId) => (
-            <button
-              key={roomId}
-              type="button"
-              onClick={() => selectRoom(roomId)}
-              className="mb-1 flex w-full items-center gap-2 rounded bg-[#404249] px-2 py-2 text-left text-white"
-            >
-              <span className="text-xl">#</span>
-              {roomTitle(roomId)}
-            </button>
-          ))}
+          {isLoadingMyTribes && myTribes.length === 0 ? (
+            <p className="px-2 py-1 text-xs text-gray-500">加载部落…</p>
+          ) : null}
+
+          {sidebarTribes.map((entry) => {
+            const selected = activeRoom === entry.tokenAddress;
+            return (
+              <button
+                key={entry.tokenAddress}
+                type="button"
+                onClick={() => selectRoom(entry.tokenAddress)}
+                title={
+                  entry.allowed
+                    ? entry.tokenAddress
+                    : `${entry.tokenAddress}（未达入群门槛）`
+                }
+                className={`mb-1 flex w-full items-center gap-2 rounded px-2 py-2 text-left ${
+                  selected
+                    ? "bg-[#404249] text-white"
+                    : entry.allowed
+                      ? "text-gray-400 hover:bg-[#35373c] hover:text-white"
+                      : "text-gray-500 hover:bg-[#35373c] hover:text-gray-300"
+                }`}
+              >
+                <span className="text-xl">#</span>
+                <span className="truncate">{tribeListLabel(entry)}</span>
+              </button>
+            );
+          })}
 
           <form onSubmit={openTribeRoom} className="mt-2 px-1">
             <input
