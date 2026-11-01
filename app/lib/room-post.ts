@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { ChainNotConfiguredError, readJoinBalance } from "./chain-gate";
+import { readJoinGateFromDb } from "./room-gate-db";
+import { ensureTribeRoomRow } from "./tribe-room-db";
+import { isPlatformAdmin } from "./tribe-auth";
 import {
   WORLD_ANNOUNCEMENTS,
   WORLD_CORE,
@@ -106,37 +108,6 @@ async function getValidRoomAccessExpiry(
   return data?.expires_at ?? null;
 }
 
-async function isPlatformAdmin(writer: SupabaseClient, address: string) {
-  const { data, error } = await app(writer)
-    .from("admins")
-    .select("role")
-    .eq("address", address)
-    .maybeSingle();
-
-  if (error) {
-    throw new Error(error.message);
-  }
-
-  return data?.role === "platform_admin";
-}
-
-async function ensureTribeRoom(writer: SupabaseClient, token: string) {
-  const { error } = await app(writer).from("rooms").upsert(
-    {
-      id: token,
-      kind: "tribe",
-      token_address: token,
-      title: token,
-      access: "token_gated",
-      post_policy: "member",
-    },
-    { onConflict: "id", ignoreDuplicates: true },
-  );
-
-  if (error) {
-    throw new Error(error.message);
-  }
-}
 
 async function grantRoomAccess(
   writer: SupabaseClient,
@@ -249,29 +220,23 @@ export async function authorizeRoomPost(
     return { ok: false, status: 403, error: "你已被禁言，无法发送消息。" };
   }
 
-  await ensureTribeRoom(writer, roomId);
+  await ensureTribeRoomRow(writer, roomId);
 
-  // A successful chain check grants a fixed 15-minute access window.
-  // Do not extend the window on cache hits: otherwise an active user could
-  // keep access forever without another on-chain balance verification.
+  // DB 持仓快照 + rooms.required_tokens；15 分钟内复用 room_access，过期后再查库。
   try {
     const cachedExpiry = await getValidRoomAccessExpiry(writer, roomId, address);
     if (cachedExpiry) {
       return { ok: true, expiresAt: cachedExpiry };
     }
 
-    const gate = await readJoinBalance(roomId, address);
+    const gate = await readJoinGateFromDb(writer, roomId, address);
     if (!gate.allowed) {
       await expireRoomAccess(writer, roomId, address);
       return { ok: false, status: 403, error: "持仓没有达到入群门槛。" };
     }
   } catch (error) {
-    if (error instanceof ChainNotConfiguredError) {
-      return { ok: false, status: 503, error: error.message };
-    }
-
-    const message = error instanceof Error ? error.message : "余额校验失败。";
-    return { ok: false, status: 502, error: `余额校验失败：${message}` };
+    const message = error instanceof Error ? error.message : "入群校验失败。";
+    return { ok: false, status: 502, error: `入群校验失败：${message}` };
   }
 
   const expiresAt = await grantRoomAccess(writer, roomId, address);

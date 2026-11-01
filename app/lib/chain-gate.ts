@@ -49,7 +49,7 @@ async function ethCall(token: string, data: string) {
   return BigInt(payload.result);
 }
 
-/** 进门权威是链上 balanceOf 与 AUTO_DELEGATE_MIN。不读 chain 表，不造余额。 */
+/** 仅供脚本/Indexer 对账；聊天入群门槛请用 room-gate-db（读 DB 快照）。 */
 export async function readJoinBalance(token: string, wallet: string) {
   const [balance, minimum] = await Promise.all([
     ethCall(token, BALANCE_OF + padAddress(wallet)),

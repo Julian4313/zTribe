@@ -705,17 +705,41 @@ export default function Home() {
                 : (rows.length ? Math.min(...rows.map(row => row.seq)) : null);
               const hasEarlier = payload?.has_more === true;
 
-              threadCacheRef.current.set(`${activeRoom}:${openThread.id}`, {
-                replies, count, beforeSeq, hasEarlier,
+              const cacheKey = `${activeRoom}:${openThread.id}`;
+              const cached = threadCacheRef.current.get(cacheKey);
+
+              // Preserve older loaded pages while replacing the refreshed page.
+              const refreshedIds = new Set(replies.map(reply => reply.id));
+              const firstOverlapIndex = cached?.replies.findIndex(
+                reply => refreshedIds.has(reply.id)
+              ) ?? -1;
+
+              const olderReplies = cached
+                ? firstOverlapIndex >= 0
+                  ? cached.replies.slice(0, firstOverlapIndex)
+                  : cached.replies
+                : [];
+
+              const mergedById = new Map<string, Message>();
+              for (const reply of [...olderReplies, ...replies]) {
+                mergedById.set(reply.id, reply);
+              }
+              const mergedReplies = Array.from(mergedById.values());
+
+              threadCacheRef.current.set(cacheKey, {
+                replies: mergedReplies,
+                count,
+                beforeSeq: cached?.beforeSeq ?? beforeSeq,
+                hasEarlier: cached?.hasEarlier ?? hasEarlier,
                 cachedAt: Date.now(),
                 stale: false,
               });
 
               if (threadTargetRef.current?.id === openThread.id) {
-                setThreadReplies(replies);
+                setThreadReplies(mergedReplies);
                 setThreadReplyCount(count);
-                setThreadBeforeSeq(beforeSeq);
-                setHasEarlierThreadReplies(hasEarlier);
+                setThreadBeforeSeq(cached?.beforeSeq ?? beforeSeq);
+                setHasEarlierThreadReplies(cached?.hasEarlier ?? hasEarlier);
               }
             } catch (error) {
               console.error("Discussion realtime refresh failed:", error);
